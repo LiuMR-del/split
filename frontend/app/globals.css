@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+/* ========================================
+ * Codex 深色主题配置
+ * 使用 Tailwind v4 的 @theme 指令定义色板
+ * ======================================== */
+
+@theme inline {
+  /* Codex 深色色板 */
+  --color-codex-bg: #0d1117;
+  --color-codex-card: #161b22;
+  --color-codex-border: #30363d;
+  --color-codex-text: #e6edf3;
+  --color-codex-text-secondary: #8b949e;
+  --color-codex-accent: #58a6ff;
+  --color-codex-success: #3fb950;
+  --color-codex-warning: #d29922;
+  --color-codex-danger: #f85149;
+
+  /* Mono 等宽字体族 */
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+}
+
+/* 全局样式：深色背景 + 浅色文字 + 等宽字体 */
+body {
+  background-color: #0d1117;
+  color: #e6edf3;
+  font-family: var(--font-mono);
+}
+
+/* 滚动条深色适配 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #8b949e;
+}

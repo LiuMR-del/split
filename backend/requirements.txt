@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+pydantic
+aiofiles
+python-dotenv
+aiosqlite
+Pillow
+pillow-heif
