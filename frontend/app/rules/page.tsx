@@ -39,7 +39,11 @@ export default function RulesPage() {
           <p className="text-sm text-codex-danger font-mono">❌ {error}</p>
         </div>
       )}
-      <RuleCardList rules={rules} loading={loading} />
+      <RuleCardList
+        rules={rules}
+        loading={loading}
+        onDeleted={(ruleId) => setRules((prev) => prev.filter((r) => r.rule_id !== ruleId))}
+      />
     </div>
   );
 }
