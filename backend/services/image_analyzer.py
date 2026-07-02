@@ -93,12 +93,27 @@ class ImageAnalyzer:
     def _generate_rule_id(self) -> str:
         """
         生成递增的规则 ID（如 RULE-0001）。
-        读取 data/rules/ 目录下已有的规则卡数量来决定编号。
+
+        取 data/rules/ 目录下已有规则卡里编号最大的一个，在其基础上 +1。
+
+        不能用"文件数量 + 1"：一旦序列中间的某条规则被删除（如删掉了
+        RULE-0016，只留 0001~0015+0017），文件数量会比实际最大编号少 1，
+        下次生成就会算出一个已经存在的编号（撞上 RULE-0017），
+        导致保存时报 409 冲突且无法恢复——因为文件数量永远比最大编号
+        少那么多，每次新建都会重新撞车。
         """
         RULES_DIR.mkdir(parents=True, exist_ok=True)
         existing = list(RULES_DIR.glob("RULE-*.json"))
-        next_num = len(existing) + 1
-        return f"RULE-{next_num:04d}"
+
+        max_num = 0
+        for f in existing:
+            try:
+                num = int(f.stem.split("-")[1])
+                max_num = max(max_num, num)
+            except (IndexError, ValueError):
+                continue
+
+        return f"RULE-{max_num + 1:04d}"
 
     def _build_rule_card(self, sabc_result: dict, rule_result: dict, image_path: str) -> dict:
         """
