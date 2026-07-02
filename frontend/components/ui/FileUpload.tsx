@@ -2,12 +2,12 @@
 
 /**
  * 文件上传组件
- * 支持拖拽上传和点击选择
+ * 支持拖拽上传、点击选择、剪贴板粘贴（Ctrl+V / Cmd+V）上传
  * 选择文件后显示预览缩略图
  * Codex 深色风格
  */
 
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 
 interface FileUploadProps {
   onFileSelect: (file: File) => void;
@@ -21,8 +21,11 @@ export default function FileUpload({
   uploading = false,
 }: FileUploadProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  /* 粘贴成功后的短暂提示反馈 */
+  const [pasteFlash, setPasteFlash] = useState(false);
 
   /* 处理文件选择 */
   const handleFile = useCallback(
@@ -69,8 +72,42 @@ export default function FileUpload({
     if (file) handleFile(file);
   };
 
+  /*
+   * 剪贴板粘贴上传（Ctrl+V / Cmd+V）。
+   * 监听在 document 上而不是组件内部：浏览器的粘贴事件不会像点击那样
+   * 冒泡到刚渲染的容器上，用户复制一张图后可能焦点还停留在别处
+   * （比如刚从截图工具切回来），只在组件内监听会经常"贴了没反应"。
+   * 用 document 监听 + 组件挂载期间才生效，离开页面自动清理。
+   */
+  useEffect(() => {
+    if (uploading) return;
+
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            handleFile(file);
+            /* 短暂高亮反馈，告诉用户粘贴生效了 */
+            setPasteFlash(true);
+            setTimeout(() => setPasteFlash(false), 500);
+          }
+          break;
+        }
+      }
+    };
+
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, [uploading, handleFile]);
+
   return (
     <div
+      ref={containerRef}
       onClick={handleClick}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -80,7 +117,7 @@ export default function FileUpload({
         w-full min-h-[200px] p-6
         border-2 border-dashed rounded-lg
         transition-colors duration-150 cursor-pointer
-        ${dragOver
+        ${dragOver || pasteFlash
           ? 'border-codex-accent bg-codex-accent/5'
           : 'border-codex-border hover:border-codex-text-secondary'
         }
@@ -104,14 +141,14 @@ export default function FileUpload({
             className="max-h-[160px] max-w-full rounded-md object-contain"
           />
           <p className="text-xs text-codex-text-secondary font-mono">
-            点击重新选择
+            点击重新选择，或直接粘贴新图片替换
           </p>
         </div>
       ) : (
         <div className="flex flex-col items-center gap-3">
           <span className="text-4xl">📸</span>
           <p className="text-sm text-codex-text-secondary font-mono text-center">
-            拖拽图片到此处，或点击选择
+            拖拽图片到此处、点击选择，或按 Ctrl+V（Mac: ⌘+V）粘贴
           </p>
         </div>
       )}
