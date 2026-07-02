@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Optional, Dict
 
 from models.image_library import ImageTag
+from services.vocab_utils import extract_chinese_part
 
 # 数据目录
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -759,16 +760,5 @@ def _build_match_reason_v2(dimension_scores: dict, core_keywords: list) -> str:
 
 
 def _extract_chinese(text: str) -> str:
-    """从 '中文/English' 格式提取中文部分
-
-    参数:
-        text: 输入文本
-
-    返回:
-        中文部分（去首尾空格）
-    """
-    if not text:
-        return ''
-    if '/' in text:
-        return text.split('/')[0].strip()
-    return text.strip()
+    """从 '中文/English' 格式提取中文部分（委托给共享的 vocab_utils）"""
+    return extract_chinese_part(text)

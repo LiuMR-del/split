@@ -8,10 +8,11 @@
 """
 
 import json
-import re
 from typing import List, Optional
 
 from prompts.prompt_generation import get_recommendation_prompt
+from services.ai_response_utils import extract_json_from_ai_response
+from services.vocab_utils import extract_english_part
 
 
 # 通用负向提示词（生图时需要排除的内容）
@@ -97,7 +98,7 @@ class PromptGenerator:
 
         # 组装英文生图提示词
         image_prompt_positive, image_prompt_negative = self._build_image_prompts(
-            layer_0, layer_2, layer_3, recommended_changes, recommended, adaptation,
+            rule_card, layer_0, layer_2, layer_3, recommended_changes, recommended, adaptation,
             library_recommendations=library_recommendations,
         )
 
@@ -410,7 +411,7 @@ class PromptGenerator:
             "negative_elements": [],
         }
         image_prompt_positive, image_prompt_negative = self._build_image_prompts(
-            layer_0, layer_2, layer_3, recommended_changes, recommended_info, adaptation,
+            rule_card, layer_0, layer_2, layer_3, recommended_changes, recommended_info, adaptation,
             library_recommendations=library_recommendations,
         )
 
@@ -432,8 +433,8 @@ class PromptGenerator:
     def _get_pod_hints(self, rule_card: dict) -> list:
         """从规则卡提取 POD（按需定制印刷）相关提示
 
-        检查 must_have_elements 中是否有名字/日期/照片槽位，
-        生成对应的英文提示词。
+        优先使用规则卡上显式的 is_text_slot 字段判断文字槽位（新分析出的规则卡会有此字段）；
+        如果规则卡是旧数据、没有 is_text_slot 字段，兜底用关键词字符串匹配（向后兼容）。
 
         参数:
             rule_card: 规则卡字典
@@ -447,38 +448,74 @@ class PromptGenerator:
         replaceable = layer3.get("replaceable_elements", {})
 
         # ── 从规则卡中提取竞品图上实际识别到的文字 ──
-        # 优先从 replaceable_elements 取原始文案值，fallback 到 must_have_elements 的描述
-        extracted_texts = {}  # slot → 实际文字
+        extracted_texts = {}  # slot/dim_name → 实际文字
 
-        # 从可替换元素中提取（这里的 original 是竞品图上的真实文案）
-        text_keywords = ['标题', '文案', '名字', '名称', '短句', '日期',
-                         'title', 'text', 'name', 'slogan', 'date']
-        for dim_name, item in replaceable.items():
-            if any(kw in dim_name.lower() for kw in text_keywords):
-                original = item.get("original", "") if isinstance(item, dict) else str(item)
-                if original and len(original) < 100:  # 排除过长的描述
-                    extracted_texts[dim_name] = original
+        # 判断这份规则卡是否属于"新版"——是否任一元素显式带了 is_text_slot 字段
+        has_explicit_flags = any(
+            isinstance(elem, dict) and "is_text_slot" in elem for elem in must_have
+        ) or any(
+            isinstance(item, dict) and "is_text_slot" in item for item in replaceable.values()
+        )
 
-        # 从 must_have_elements 中补充（如果 replaceable 没覆盖到的文字槽位）
-        for elem in must_have:
-            if not isinstance(elem, dict):
-                continue
-            slot = elem.get("slot", "")
-            desc = elem.get("description", "")
-            slot_lower = (slot + desc).lower()
-            if any(kw in slot_lower for kw in text_keywords):
-                # 检查 desc 是否像具体文案（而非"两个人名字"这种描述）
-                if slot not in extracted_texts:
-                    # 如果 desc 是具体英文文案（包含英文字母且不太长），直接用
-                    has_english = any(c.isalpha() and ord(c) < 128 for c in desc)
-                    if has_english and len(desc) < 80:
-                        extracted_texts[slot] = desc
-                    elif "名字" in slot_lower or "name" in slot_lower:
-                        extracted_texts[slot] = "NAME"
-                    elif "日期" in slot_lower or "date" in slot_lower:
-                        extracted_texts[slot] = "2026"
+        if has_explicit_flags:
+            # ── 优先路径：显式 is_text_slot 字段（新规则卡，VLM 分析阶段已标注）──
+            # 从 replaceable_elements 里标记了 is_text_slot=True 的项取原始文案
+            for dim_name, item in replaceable.items():
+                if isinstance(item, dict) and item.get("is_text_slot"):
+                    original = item.get("original", "")
+                    if original and len(original) < 100:  # 排除过长的描述
+                        extracted_texts[dim_name] = original
 
-        # ── 生成 POD 定制提示词 ──
+            # 从 must_have_elements 里标记了 is_text_slot=True 的项取描述
+            for elem in must_have:
+                if not isinstance(elem, dict) or not elem.get("is_text_slot"):
+                    continue
+                slot = elem.get("slot", "")
+                desc = elem.get("description", "")
+                if slot in extracted_texts:
+                    continue
+                # 如果 desc 是具体英文文案（包含英文字母且不太长），直接用
+                has_english = any(c.isalpha() and ord(c) < 128 for c in desc)
+                if has_english and len(desc) < 80:
+                    extracted_texts[slot] = desc
+                elif "名字" in slot.lower() or "name" in slot.lower():
+                    extracted_texts[slot] = "NAME"
+                elif "日期" in slot.lower() or "date" in slot.lower():
+                    extracted_texts[slot] = "2026"
+                elif desc:
+                    extracted_texts[slot] = desc[:50] if len(desc) < 50 else "NAME"
+        else:
+            # ── 兜底路径：关键词字符串匹配（兼容没有 is_text_slot 字段的旧规则卡）──
+            text_keywords = ['标题', '文案', '名字', '名称', '短句', '日期',
+                             'title', 'text', 'name', 'slogan', 'date']
+
+            # 从可替换元素中提取（这里的 original 是竞品图上的真实文案）
+            for dim_name, item in replaceable.items():
+                if any(kw in dim_name.lower() for kw in text_keywords):
+                    original = item.get("original", "") if isinstance(item, dict) else str(item)
+                    if original and len(original) < 100:  # 排除过长的描述
+                        extracted_texts[dim_name] = original
+
+            # 从 must_have_elements 中补充（如果 replaceable 没覆盖到的文字槽位）
+            for elem in must_have:
+                if not isinstance(elem, dict):
+                    continue
+                slot = elem.get("slot", "")
+                desc = elem.get("description", "")
+                slot_lower = (slot + desc).lower()
+                if any(kw in slot_lower for kw in text_keywords):
+                    # 检查 desc 是否像具体文案（而非"两个人名字"这种描述）
+                    if slot not in extracted_texts:
+                        # 如果 desc 是具体英文文案（包含英文字母且不太长），直接用
+                        has_english = any(c.isalpha() and ord(c) < 128 for c in desc)
+                        if has_english and len(desc) < 80:
+                            extracted_texts[slot] = desc
+                        elif "名字" in slot_lower or "name" in slot_lower:
+                            extracted_texts[slot] = "NAME"
+                        elif "日期" in slot_lower or "date" in slot_lower:
+                            extracted_texts[slot] = "2026"
+
+        # ── 生成 POD 定制提示词（这部分逻辑不变） ──
         hints = []  # type: List[str]
 
         if extracted_texts:
@@ -523,8 +560,8 @@ class PromptGenerator:
 
         try:
             # 调用 AI（纯文本请求，不需要图片）
-            response = await self._ai_text_request(system_prompt, user_prompt)
-            result = self._extract_json(response)
+            response = await self.ai_client.text_request(system_prompt, user_prompt)
+            result = extract_json_from_ai_response(response)
 
             # 校验返回结构
             if "recommended_changes" in result:
@@ -541,56 +578,6 @@ class PromptGenerator:
             fallback = self._random_recommend(layer_3, target_product)
             fallback["reason"] = f"AI 调用失败（{str(e)}），已降级为随机推荐"
             return fallback
-
-    async def _ai_text_request(self, system_prompt: str, user_prompt: str) -> str:
-        """通过 AIClient 发送纯文本请求
-
-        复用 AIClient 的请求能力，根据 provider 选择不同格式。
-        """
-        import httpx
-        config = self.ai_client.config
-
-        if config.provider == "anthropic":
-            url = f"{config.api_url.rstrip('/')}/messages"
-            headers = {
-                "x-api-key": config.api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            }
-            body = {
-                "model": config.model,
-                "max_tokens": 4096,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
-            }
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                for block in data.get("content", []):
-                    if block.get("type") == "text":
-                        return block["text"]
-                return ""
-        else:
-            # OpenAI 兼容格式
-            url = f"{config.api_url.rstrip('/')}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {config.api_key}",
-                "Content-Type": "application/json",
-            }
-            body = {
-                "model": config.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "max_tokens": 4096,
-            }
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
 
     def _random_recommend(self, layer_3: dict, target_product: str) -> dict:
         """随机推荐模式：从 alternatives 中取第一个替代方案
@@ -755,6 +742,7 @@ class PromptGenerator:
 
     def _build_image_prompts(
         self,
+        rule_card: dict,
         layer_0: dict,
         layer_2: dict,
         layer_3: dict,
@@ -766,6 +754,7 @@ class PromptGenerator:
         """组装英文生图提示词（正向 + 负向）
 
         参数:
+            rule_card: 完整规则卡字典（供 _get_pod_hints 提取真实定制文案）
             layer_0: 第0层核心卖点
             layer_2: 第2层视觉结构
             layer_3: 第3层可变边界
@@ -930,54 +919,5 @@ class PromptGenerator:
         }
 
     def _extract_english(self, text: str) -> str:
-        """从 "中文/English" 格式的文本中提取英文部分
-
-        如果文本包含 "/"，取 "/" 后面的部分；
-        否则原样返回（可能本身就是纯英文或纯中文）。
-
-        参数:
-            text: 输入文本
-
-        返回:
-            提取出的英文部分
-        """
-        if not text:
-            return ""
-        if "/" in text:
-            return text.split("/", 1)[1].strip()
-        return text
-
-    def _extract_json(self, text: str) -> dict:
-        """从 AI 响应文本中提取 JSON
-
-        依次尝试三种策略（与 image_analyzer 中的逻辑一致）：
-        1. 直接解析整段文本
-        2. 提取 ```json ... ``` 代码块
-        3. 找第一个 { 到最后一个 } 之间的内容
-        """
-        # 策略 1：直接解析
-        try:
-            return json.loads(text.strip())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # 策略 2：代码块提取
-        pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # 策略 3：花括号范围
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            try:
-                return json.loads(text[first_brace:last_brace + 1])
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # 全部失败
-        return {"raw_response": text, "parse_error": "无法从 AI 响应中提取有效 JSON"}
+        """从 "中文/English" 格式的文本中提取英文部分（委托给共享的 vocab_utils）"""
+        return extract_english_part(text)

@@ -13,7 +13,7 @@ import Button from '@/components/ui/Button';
 import AnalysisProgress from '@/components/analyze/AnalysisProgress';
 import RuleCardPreview from '@/components/analyze/RuleCardPreview';
 import PromptTabs from '@/components/prompts/PromptTabs';
-import { apiUpload, apiPost, getImageUrl } from '@/lib/api';
+import { apiUpload, apiPost, getImageUrl, unwrapData } from '@/lib/api';
 import Link from 'next/link';
 
 /* 页面状态类型 */
@@ -67,7 +67,7 @@ export default function AnalyzePage() {
       /* 兼容两种后端返回格式：
        * 1. { success: true, data: { rule_card: {...}, ... } }
        * 2. 直接返回 { rule_card: {...}, ... } */
-      const data = response?.data || response;
+      const data = unwrapData<any>(response);
       const card = data?.rule_card || data;
 
       if (card && typeof card === 'object' && !card.parse_error) {
@@ -97,7 +97,7 @@ export default function AnalyzePage() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiPost<any>('/api/rules', ruleCard);
       /* 从后端返回中获取 rule_id */
-      const savedData = res?.data || res;
+      const savedData = unwrapData<any>(res);
       const ruleId = savedData?.rule_id || ruleCard?.rule_id || '';
       setSavedRuleId(ruleId);
       setPageState('saved');

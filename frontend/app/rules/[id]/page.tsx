@@ -8,7 +8,7 @@
 
 import { useState, useEffect } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { apiGet, apiPut } from '@/lib/api';
+import { apiGet, apiPut, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
 import RuleCardEditor from '@/components/rules/RuleCardEditor';
 import PromptTabs from '@/components/prompts/PromptTabs';
@@ -47,7 +47,7 @@ export default function RuleDetailPage() {
           apiGet('/api/vocabularies'),
         ]);
         // GET /api/rules/{id} 返回 {"success": true, "data": {...}}，提取实际数据
-        setRuleCard(ruleRes.data || ruleRes);
+        setRuleCard(unwrapData(ruleRes));
         // GET /api/vocabularies 直接返回 {target_audience: [...], ...}（无 {success, data} 包装）
         setVocabularies(vocabRes);
       } catch (err) {

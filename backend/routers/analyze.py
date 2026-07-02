@@ -12,6 +12,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from models.settings import AIModelConfig
 from services.ai_client import AIClient
 from services.image_analyzer import ImageAnalyzer
+from services.image_format_utils import UPLOAD_ACCEPTED_MIME_TYPES
 
 router = APIRouter()
 
@@ -48,12 +49,11 @@ async def analyze_image(file: UploadFile = File(...)):
     3. 调用 ImageAnalyzer.analyze()
     4. 返回分析结果（规则卡 JSON + SABC 分级结果）
     """
-    # 校验文件类型（支持常见图片格式）
-    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/avif", "image/gif", "image/bmp", "image/tiff"}
-    if file.content_type not in allowed_types:
+    # 校验文件类型（支持的格式统一在 image_format_utils.UPLOAD_ACCEPTED_MIME_TYPES 维护）
+    if file.content_type not in UPLOAD_ACCEPTED_MIME_TYPES:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型: {file.content_type}，请上传 JPG/PNG/WebP/AVIF 图片",
+            detail=f"不支持的文件类型: {file.content_type}，请上传 JPG/PNG/WebP/AVIF/GIF/BMP/TIFF 图片",
         )
 
     # 保存上传的图片：用时间戳 + 原文件名避免重名

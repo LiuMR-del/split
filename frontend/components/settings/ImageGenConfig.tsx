@@ -11,7 +11,7 @@ import { useState, useEffect, useCallback } from 'react';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
-import { apiGet, apiPost } from '@/lib/api';
+import { apiGet, apiPost, unwrapData } from '@/lib/api';
 
 /* 后端返回的生图配置数据结构 */
 interface GenConfigData {
@@ -57,7 +57,7 @@ export default function ImageGenConfig() {
   /* ====== 加载已有配置 ====== */
   const loadConfig = useCallback(async () => {
     try {
-      const data = await apiGet<GenConfigData>('/api/gen/config');
+      const data = unwrapData<GenConfigData>(await apiGet<GenConfigData>('/api/gen/config'));
       if (data) {
         const loadedType = data.api_type || 'openai';
         setApiType(loadedType);
@@ -97,12 +97,14 @@ export default function ImageGenConfig() {
     setSaveResult(null);
 
     try {
-      const res = await apiPost<TestResponse>('/api/gen/test', {
-        api_url: apiUrl,
-        api_key: apiKey,
-        model,
-        api_type: apiType,
-      });
+      const res = unwrapData<TestResponse>(
+        await apiPost<TestResponse>('/api/gen/test', {
+          api_url: apiUrl,
+          api_key: apiKey,
+          model,
+          api_type: apiType,
+        })
+      );
       setTestResult({
         ok: res.success,
         msg: res.success ? '连接成功' : (res.message || '连接失败'),

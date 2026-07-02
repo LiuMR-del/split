@@ -101,3 +101,23 @@ export async function apiUpload<T>(
 
   return response.json();
 }
+
+/**
+ * 统一解包后端响应。
+ *
+ * 后端接口分两种返回格式：
+ * - 包装格式：{"success": true, "data": ...}（rules/analyze/prompts/library 等大多数接口）
+ * - 裸数据格式：直接返回数据本身（settings/vocabularies/gen 相关接口）
+ *
+ * 这个函数自动判断并返回真正的数据，调用方不用每次手写 res.data || res 猜测。
+ * 只有当响应同时具备 success 和 data 两个字段时才解包，否则原样返回
+ * （所以 {success, message} 这种没有 data 字段的响应会原样返回，
+ *  调用方可以正常读取 message）。
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function unwrapData<T>(res: any): T {
+  if (res && typeof res === 'object' && 'success' in res && 'data' in res) {
+    return res.data as T;
+  }
+  return res as T;
+}

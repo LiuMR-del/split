@@ -91,6 +91,8 @@ def get_rule_extraction_prompt() -> str:
   - description：元素描述
   - position：位置（如"中心"、"顶部"、"底部弧形"）
   - visual_weight：视觉权重（"高/中/低"）
+  - is_text_slot：是否为文字类槽位（true/false）。凡是名字、日期、祝福语、标语、
+    产品文案等需要印刷具体文字内容的槽位都标记为 true；纯图形/图案元素标记为 false
 - **style**：从受控词表选择视觉风格
 - **color_mood**：从受控词表选择色彩情绪
 - **text_hierarchy**：文字层级描述（如"主标题大号 + 副标题小号"）
@@ -100,6 +102,7 @@ def get_rule_extraction_prompt() -> str:
 - **replaceable_elements**：可替换元素字典，key 为元素名，value 包含：
   - original：原始值
   - alternatives：可替换的选项列表（给出 3-5 个建议）
+  - is_text_slot：是否为文字类槽位（true/false），判断标准同上
 - **must_not_change**：绝对不能替换的元素列表
 
 ### 第 4 层：产品适配层（layer_4_product）
@@ -148,7 +151,7 @@ def get_rule_extraction_prompt() -> str:
   "layer_2_visual": {{
     "layout_formula": "...",
     "must_have_elements": [
-      {{"slot": "...", "description": "...", "position": "...", "visual_weight": "..."}}
+      {{"slot": "...", "description": "...", "position": "...", "visual_weight": "...", "is_text_slot": false}}
     ],
     "style": "...",
     "color_mood": "...",
@@ -156,7 +159,7 @@ def get_rule_extraction_prompt() -> str:
   }},
   "layer_3_variable": {{
     "replaceable_elements": {{
-      "元素名": {{"original": "...", "alternatives": ["...", "..."]}}
+      "元素名": {{"original": "...", "alternatives": ["...", "..."], "is_text_slot": false}}
     }},
     "must_not_change": ["..."]
   }},

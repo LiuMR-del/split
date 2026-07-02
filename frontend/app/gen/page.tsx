@@ -10,7 +10,7 @@ import { useState, useEffect, useCallback } from 'react';
 import Card from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import Link from 'next/link';
-import { apiGet, apiDelete } from '@/lib/api';
+import { apiGet, apiDelete, unwrapData } from '@/lib/api';
 
 /* 生图任务数据结构 */
 interface GenTask {
@@ -71,8 +71,8 @@ export default function GenPage() {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiGet<any>('/api/gen/tasks');
-      const data = res.data || res;
-      // 后端返回 {items: [...]} 或 {tasks: [...]} 或直接数组
+      const data = unwrapData<any>(res);
+      // 后端返回 {items: [...]} 或 {tasks: [...]} 或直接数组（裸数据，unwrapData 原样透传）
       const list = data.items || data.tasks || (Array.isArray(data) ? data : []);
       // 统一把 image_urls 字符串数组转成 images 对象数组
       const normalized = list.map((t: GenTask) => ({

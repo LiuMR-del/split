@@ -30,6 +30,7 @@ class MustHaveElement(BaseModel):
     description: str = Field(description="元素描述")
     position: str = Field(description="位置")
     visual_weight: str = Field(description="视觉权重")
+    is_text_slot: bool = Field(default=False, description="是否为文字类槽位（名字/日期/文案等个性化定制文字）")
 
 
 class VisualStructureLayer(BaseModel):
@@ -45,6 +46,7 @@ class ReplaceableItem(BaseModel):
     """可替换项"""
     original: str = Field(description="原始值")
     alternatives: List[str] = Field(description="可替换选项")
+    is_text_slot: bool = Field(default=False, description="是否为文字类槽位（名字/日期/文案等个性化定制文字）")
 
 
 class VariableBoundaryLayer(BaseModel):

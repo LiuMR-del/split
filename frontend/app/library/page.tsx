@@ -7,7 +7,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { apiGet } from '@/lib/api';
+import { apiGet, unwrapData } from '@/lib/api';
 import Link from 'next/link';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
@@ -68,9 +68,8 @@ export default function LibraryPage() {
   useEffect(() => {
     const loadVocabularies = async () => {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const res = await apiGet<any>('/api/vocabularies');
-        setVocabularies(res.data || res || {});
+        const res = await apiGet<Vocabularies>('/api/vocabularies');
+        setVocabularies(unwrapData<Vocabularies>(res) || {});
       } catch {
         /* 词表加载失败不影响主功能 */
       }
@@ -96,8 +95,8 @@ export default function LibraryPage() {
         `/api/library?${params.toString()}`
       );
 
-      /* 防御性解包：后端返回 { success, data: { items, total, ... } } */
-      const payload = res.data || {};
+      /* 统一解包：后端返回 { success, data: { items, total, ... } } */
+      const payload = unwrapData<LibraryListData>(res) || {};
       const items = payload.items || [];
       setImages(Array.isArray(items) ? items : []);
       setTotal(payload.total || 0);

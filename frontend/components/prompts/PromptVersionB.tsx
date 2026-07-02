@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react';
-import { apiPost } from '@/lib/api';
+import { apiPost, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
@@ -65,7 +65,7 @@ export default function PromptVersionB({ ruleId, ruleCard }: PromptVersionBProps
         target_product: targetProduct,
       });
       // 后端返回 {"success": true, "data": {...}}
-      setResult(res.data || res);
+      setResult(unwrapData(res));
     } catch (err) {
       const msg = err instanceof Error ? err.message : '生成失败';
       setError(msg);

@@ -12,7 +12,7 @@ import Link from 'next/link';
 import Card from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
-import { apiPost, apiGet } from '@/lib/api';
+import { apiPost, apiGet, unwrapData } from '@/lib/api';
 
 /* 提示词生成结果类型 */
 export interface PromptResult {
@@ -509,7 +509,7 @@ function ImageGenSection({
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const res = await apiGet<any>(`/api/gen/task/${tid}`);
-        const task: GenTaskResponse = res.data || res;
+        const task: GenTaskResponse = unwrapData(res);
 
         if (task.status === 'completed' || task.status === 'succeeded') {
           setTaskStatus('completed');
@@ -577,8 +577,8 @@ function ImageGenSection({
         height: submitHeight,
         count,
       });
-      // 后端返回 {submitted, tasks: [{task_id, ...}], errors}
-      const data = res.data || res;
+      // 后端返回 {submitted, tasks: [{task_id, ...}], errors}（裸数据，unwrapData 原样透传）
+      const data = unwrapData<any>(res);
       const firstTask = data.tasks?.[0] || data;
       const returnedTaskId = firstTask.task_id || data.task_id;
 

@@ -8,7 +8,7 @@
  */
 
 import { useState, useEffect } from 'react';
-import { apiPost, apiPut, apiDelete, getImageUrl } from '@/lib/api';
+import { apiPost, apiPut, apiDelete, getImageUrl, unwrapData } from '@/lib/api';
 import Modal from '@/components/ui/Modal';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
@@ -115,7 +115,7 @@ export default function ImageDetailModal({
       const imageId = image.image_id || image.id;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiPost<any>(`/api/library/${imageId}/tag`);
-      const tags = res.data || {};
+      const tags = unwrapData<any>(res) || {};
       /* 用 AI 返回的标签更新表单（后端返回扁平结构） */
       if (tags.themes) setThemes(tags.themes);
       if (tags.styles?.length) setStyle(tags.styles[0]);

@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect } from 'react';
-import { apiGet, apiPost } from '@/lib/api';
+import { apiGet, apiPost, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import Card from '@/components/ui/Card';
@@ -68,7 +68,7 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const res = await apiGet<any>(`/api/prompts/template-c/${ruleId}`);
         // 后端返回 {"success": true, "data": {...}}
-        const tmpl: TemplateData = res.data || res;
+        const tmpl: TemplateData = unwrapData(res);
         setTemplate(tmpl);
 
         /* 初始化各维度的默认选中值（选original） */
@@ -138,7 +138,7 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
         target_product: targetProduct,
       });
       // 后端返回 {"success": true, "data": {...}}
-      setResult(res.data || res);
+      setResult(unwrapData(res));
     } catch (err) {
       const msg = err instanceof Error ? err.message : '生成失败';
       setError(msg);

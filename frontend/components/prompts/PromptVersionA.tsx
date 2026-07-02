@@ -12,7 +12,7 @@
  */
 
 import { useState, useEffect } from 'react';
-import { apiPost, getImageUrl } from '@/lib/api';
+import { apiPost, getImageUrl, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import Card from '@/components/ui/Card';
@@ -95,7 +95,7 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
           rule_id: ruleId,
         });
         /* 后端返回 {success, data: {recommendations: [...]}} */
-        const data = res.data ?? res;
+        const data = unwrapData<any>(res);
         const list = Array.isArray(data)
           ? data
           : Array.isArray(data?.recommendations)
@@ -181,7 +181,7 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
         target_product: targetProduct,
         reference_image_ids: Array.from(selectedIds),
       });
-      setResult(res.data || res);
+      setResult(unwrapData(res));
     } catch (err) {
       const msg = err instanceof Error ? err.message : '生成失败';
       setError(msg);

@@ -12,7 +12,6 @@
   POST   /api/library/recommend        → 基于规则卡推荐相似图片
 """
 
-import json
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -22,8 +21,7 @@ from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Query
 from pydantic import BaseModel
 
 from models.image_library import ImageTag
-from models.settings import AIModelConfig
-from services.ai_client import AIClient
+from services.ai_client import load_ai_client_from_config
 from services.image_tagger import ImageTagger
 from services import image_library_store as store
 
@@ -31,7 +29,6 @@ router = APIRouter(prefix="/library", tags=["图片库"])
 
 # 数据目录
 DATA_DIR = Path(__file__).parent.parent / "data"
-CONFIG_PATH = DATA_DIR / "config.json"
 
 
 # ==================== 请求体模型 ====================
@@ -58,21 +55,6 @@ class RecommendRequest(BaseModel):
 
 
 # ==================== 辅助函数 ====================
-
-
-def _load_ai_client() -> Optional[AIClient]:
-    """加载 AI 客户端配置，失败返回 None"""
-    if not CONFIG_PATH.exists():
-        return None
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        config = AIModelConfig(**config_data)
-        if not config.api_key:
-            return None
-        return AIClient(config)
-    except Exception:
-        return None
 
 
 def _generate_thumbnail(image_path: str, thumbnail_path: str) -> bool:
@@ -130,7 +112,7 @@ async def upload_images(
     ai_client = None
     tagger = None
     if auto_tag:
-        ai_client = _load_ai_client()
+        ai_client = load_ai_client_from_config()
         if ai_client:
             tagger = ImageTagger(ai_client)
 
@@ -312,7 +294,7 @@ async def tag_image(image_id: str):
         raise HTTPException(status_code=404, detail=f"图片 {image_id} 不存在")
 
     # 加载 AI 客户端
-    ai_client = _load_ai_client()
+    ai_client = load_ai_client_from_config()
     if not ai_client:
         raise HTTPException(status_code=400, detail="AI 模型未配置，请先在设置中配置 AI 模型")
 

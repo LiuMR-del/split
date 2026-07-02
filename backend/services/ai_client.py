@@ -2,8 +2,41 @@
 统一 AI 客户端 - 支持 OpenAI 和 Anthropic API 格式
 """
 
+import json
+from pathlib import Path
+from typing import Optional
+
 import httpx
 from models.settings import AIModelConfig
+
+# 默认配置文件路径（AI 分析模型配置，与生图配置 gen_config.json 分开存）
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "data" / "config.json"
+
+
+def load_ai_client_from_config(config_path: Optional[Path] = None) -> Optional["AIClient"]:
+    """从配置文件加载 AIClient，配置缺失或 api_key 为空时返回 None。
+
+    供 routers/prompts.py、routers/library.py 等多处路由共用，
+    避免各自重复实现"读 config.json → 校验 api_key → 构造 AIClient"。
+
+    参数:
+        config_path: 配置文件路径，默认为 data/config.json
+
+    返回:
+        AIClient 实例；配置不存在/无效/api_key 为空时返回 None
+    """
+    path = config_path or DEFAULT_CONFIG_PATH
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        if not config_data.get("api_key"):
+            return None
+        config = AIModelConfig(**config_data)
+        return AIClient(config)
+    except Exception:
+        return None
 
 
 class AIClient:
@@ -29,6 +62,17 @@ class AIClient:
         else:
             # openai 和 custom 都走 OpenAI 兼容格式
             return await self._openai_image_request(image_base64, system_prompt, user_prompt, media_type)
+
+    async def text_request(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        发送纯文本请求（不带图片），返回文本响应。
+        根据 provider 自动选择 OpenAI 或 Anthropic 请求格式。
+        供需要纯文本 AI 调用的场景使用（如 prompt_generator 的改款推荐）。
+        """
+        if self.config.provider == "anthropic":
+            return await self._anthropic_text_request(system_prompt, user_prompt)
+        else:
+            return await self._openai_text_request(system_prompt, user_prompt)
 
     async def test_connection(self) -> dict:
         """
@@ -73,6 +117,28 @@ class AIClient:
                         {"type": "text", "text": user_prompt},
                     ],
                 },
+            ],
+            "max_tokens": 4096,
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+
+    async def _openai_text_request(self, system_prompt: str, user_prompt: str) -> str:
+        """OpenAI 格式的纯文本请求（不带图片）"""
+        url = f"{self.config.api_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             "max_tokens": 4096,
         }
@@ -157,6 +223,30 @@ class AIClient:
             resp.raise_for_status()
             data = resp.json()
             # Anthropic 响应格式：content 是数组，取第一个 text block
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    return block["text"]
+            return ""
+
+    async def _anthropic_text_request(self, system_prompt: str, user_prompt: str) -> str:
+        """Anthropic 格式的纯文本请求（不带图片）"""
+        url = f"{self.config.api_url.rstrip('/')}/messages"
+        headers = {
+            "x-api-key": self.config.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.config.model,
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
             for block in data.get("content", []):
                 if block.get("type") == "text":
                     return block["text"]

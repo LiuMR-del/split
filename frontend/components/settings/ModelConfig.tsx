@@ -10,7 +10,7 @@ import { useState, useEffect, useCallback } from 'react';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
-import { apiGet, apiPost } from '@/lib/api';
+import { apiGet, apiPost, unwrapData } from '@/lib/api';
 
 /* Provider 类型 */
 type Provider = 'openai' | 'anthropic' | 'custom';
@@ -78,8 +78,8 @@ export default function ModelConfig() {
   /* ====== 加载已有配置 ====== */
   const loadSettings = useCallback(async () => {
     try {
-      // GET /api/settings 直接返回 SettingsResponse（无 {success, data} 包装）
-      const data = await apiGet<SettingsData>('/api/settings');
+      // GET /api/settings 直接返回 SettingsResponse（无 {success, data} 包装，unwrapData 原样透传）
+      const data = unwrapData<SettingsData>(await apiGet<SettingsData>('/api/settings'));
       if (data) {
         setProvider(data.provider || 'openai');
         setApiUrl(data.api_url || DEFAULT_URLS[data.provider || 'openai']);
@@ -113,12 +113,14 @@ export default function ModelConfig() {
     if (!apiUrl || !apiKey) return;
     setFetchingModels(true);
     try {
-      const res = await apiPost<{ models: ModelItem[]; error?: string }>('/api/settings/models', {
-        provider,
-        api_url: apiUrl,
-        api_key: apiKey,
-        model: model || 'temp',
-      });
+      const res = unwrapData<{ models: ModelItem[]; error?: string }>(
+        await apiPost<{ models: ModelItem[]; error?: string }>('/api/settings/models', {
+          provider,
+          api_url: apiUrl,
+          api_key: apiKey,
+          model: model || 'temp',
+        })
+      );
       if (res.models && res.models.length > 0) {
         setModelList(res.models);
       } else {
@@ -138,12 +140,14 @@ export default function ModelConfig() {
     setSaveResult(null);
 
     try {
-      const res = await apiPost<TestResponse>('/api/settings/test', {
-        provider,
-        api_url: apiUrl,
-        api_key: apiKey,
-        model,
-      });
+      const res = unwrapData<TestResponse>(
+        await apiPost<TestResponse>('/api/settings/test', {
+          provider,
+          api_url: apiUrl,
+          api_key: apiKey,
+          model,
+        })
+      );
       setTestResult({
         ok: res.success,
         msg: res.success ? '连接成功' : (res.message || '连接失败'),

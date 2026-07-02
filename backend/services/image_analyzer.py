@@ -3,14 +3,12 @@
 调用 VLM 进行 SABC 分级 + 6 层规则拆解，输出完整规则卡。
 """
 
-import base64
-import io
-import json
-import re
 from datetime import datetime
 from pathlib import Path
 
 from services.ai_client import AIClient
+from services.image_format_utils import prepare_image_for_vlm
+from services.ai_response_utils import extract_json_from_ai_response
 from models.rule_card import RuleCard
 from prompts.sabc_grading import SABC_GRADING_SYSTEM_PROMPT
 from prompts.rule_extraction import get_rule_extraction_prompt
@@ -18,58 +16,12 @@ from prompts.rule_extraction import get_rule_extraction_prompt
 # 规则卡 JSON 文件存储目录
 RULES_DIR = Path(__file__).parent.parent / "data" / "rules"
 
-# VLM API 通常只支持这些格式，其他格式需要转换
-VLM_SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-
-# 注册 AVIF/HEIF 支持（如果 pillow-heif 已安装）
-try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-except ImportError:
-    pass
-
 
 class ImageAnalyzer:
     """图片分析器：调用 VLM 分析竞品图，输出规则卡"""
 
     def __init__(self, ai_client: AIClient):
         self.ai_client = ai_client
-
-    def _prepare_image(self, image_path: str) -> tuple:
-        """
-        读取图片并准备 base64 + media_type。
-        如果图片格式不被 VLM 支持（avif/bmp/tiff 等），自动转换为 JPEG。
-        返回 (base64_string, media_type)
-        """
-        suffix = Path(image_path).suffix.lower()
-
-        # VLM 原生支持的格式，直接读取
-        if suffix in VLM_SUPPORTED_FORMATS:
-            image_data = Path(image_path).read_bytes()
-            type_map = {
-                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".png": "image/png", ".webp": "image/webp",
-                ".gif": "image/gif",
-            }
-            media_type = type_map.get(suffix, "image/jpeg")
-            return base64.b64encode(image_data).decode(), media_type
-
-        # 不支持的格式（avif/bmp/tiff 等），用 Pillow 转成 JPEG
-        try:
-            from PIL import Image
-            img = Image.open(image_path)
-            # RGBA/透明通道转 RGB（JPEG 不支持透明）
-            if img.mode in ("RGBA", "LA", "P"):
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
-        except ImportError:
-            # Pillow 没安装，降级直接发原格式（可能被 API 拒绝）
-            image_data = Path(image_path).read_bytes()
-            return base64.b64encode(image_data).decode(), "image/jpeg"
-        except Exception as e:
-            raise Exception(f"图片格式转换失败（{suffix}）: {str(e)}")
 
     async def analyze(self, image_path: str) -> dict:
         """
@@ -79,8 +31,8 @@ class ImageAnalyzer:
         3. 第二步：调 VLM 做 6 层规则拆解
         4. 合并结果，生成规则卡
         """
-        # 读取图片并转 base64（自动处理格式兼容）
-        image_base64, media_type = self._prepare_image(image_path)
+        # 读取图片并转 base64（自动处理格式兼容，逻辑见 image_format_utils）
+        image_base64, media_type = prepare_image_for_vlm(image_path)
 
         # 第一步：SABC 分级
         sabc_result = await self._grade_sabc(image_base64, media_type)
@@ -118,7 +70,7 @@ class ImageAnalyzer:
             media_type=media_type,
         )
 
-        return self._extract_json(response)
+        return extract_json_from_ai_response(response)
 
     async def _extract_rules(self, image_base64: str, media_type: str) -> dict:
         """调 VLM 做 6 层规则拆解"""
@@ -136,42 +88,7 @@ class ImageAnalyzer:
             media_type=media_type,
         )
 
-        return self._extract_json(response)
-
-    def _extract_json(self, text: str) -> dict:
-        """
-        从 VLM 响应文本中提取 JSON。
-        依次尝试三种策略：
-        1. 直接解析整段文本
-        2. 提取 ```json ... ``` 代码块中的内容
-        3. 找第一个 { 到最后一个 } 之间的内容
-        """
-        # 策略 1：直接解析整段文本
-        try:
-            return json.loads(text.strip())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # 策略 2：提取 ```json ... ``` 代码块
-        pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # 策略 3：找第一个 { 到最后一个 } 之间的内容
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            try:
-                return json.loads(text[first_brace : last_brace + 1])
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # 全部失败，返回原始文本包装
-        return {"raw_response": text, "parse_error": "无法从 VLM 响应中提取有效 JSON"}
+        return extract_json_from_ai_response(response)
 
     def _generate_rule_id(self) -> str:
         """

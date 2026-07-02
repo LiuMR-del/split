@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect } from 'react';
-import { apiGet } from '@/lib/api';
+import { apiGet, unwrapData } from '@/lib/api';
 import RuleCardList from '@/components/rules/RuleCardList';
 
 export default function RulesPage() {
@@ -19,10 +19,9 @@ export default function RulesPage() {
     async function loadRules() {
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const res = await apiGet<any>('/api/rules');
         // 后端返回 {"success": true, "data": [...], "total": N}
-        setRules(Array.isArray(res) ? res : (res.data || []));
+        setRules(unwrapData<any[]>(res) || []);
       } catch (err) {
         const msg = err instanceof Error ? err.message : '加载失败';
         setError(msg);

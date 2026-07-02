@@ -5,23 +5,17 @@
 - POST /api/prompts/generate-c       → 版本C：根据用户选择生成提示词
 """
 
-import json
-from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.rule_store import get_rule
 from services.prompt_generator import PromptGenerator
-from services.ai_client import AIClient
+from services.ai_client import load_ai_client_from_config
 from services.image_library_store import get_image
-from models.settings import AIModelConfig
 
 router = APIRouter()
-
-# 配置文件路径
-CONFIG_PATH = Path(__file__).parent.parent / "data" / "config.json"
 
 
 # ==================== 请求体模型 ====================
@@ -44,27 +38,6 @@ class GenerateCRequest(BaseModel):
     rule_id: str
     selections: dict
     target_product: str
-
-
-# ==================== 辅助函数 ====================
-
-def _load_ai_client() -> Optional[AIClient]:
-    """尝试加载 AI 客户端配置
-
-    如果配置文件存在且 api_key 非空，返回 AIClient 实例；
-    否则返回 None（降级为随机推荐模式）。
-    """
-    if not CONFIG_PATH.exists():
-        return None
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        if not config_data.get("api_key"):
-            return None
-        config = AIModelConfig(**config_data)
-        return AIClient(config)
-    except Exception:
-        return None
 
 
 # ==================== 路由 ====================
@@ -98,7 +71,7 @@ async def generate_version_a(request: GenerateARequest):
         )
 
     # 3. 调用 prompt_generator 的版本 A 方法
-    ai_client = _load_ai_client()
+    ai_client = load_ai_client_from_config()
     generator = PromptGenerator(ai_client=ai_client)
     try:
         result = await generator.generate_version_a(
@@ -131,7 +104,7 @@ async def generate_version_b(request: GenerateBRequest):
         )
 
     # 加载 AI 客户端（可能为 None）
-    ai_client = _load_ai_client()
+    ai_client = load_ai_client_from_config()
 
     # 生成提示词
     generator = PromptGenerator(ai_client=ai_client)
