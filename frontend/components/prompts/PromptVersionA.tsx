@@ -458,7 +458,14 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
       )}
 
       {/* ── 生成结果 ── */}
-      {result && <PromptDisplay result={result} ruleId={ruleId} />}
+      {result && (
+        <PromptDisplay
+          result={result}
+          ruleId={ruleId}
+          ruleName={ruleCard?.rule_name}
+          version="A"
+        />
+      )}
     </div>
   );
 }

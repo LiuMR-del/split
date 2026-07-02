@@ -48,6 +48,10 @@ export interface PromptResult {
 interface PromptDisplayProps {
   result: PromptResult;
   ruleId?: string;
+  /** 规则名称，随生图请求一起提交，方便生图任务页按规则分组展示时不用反查 */
+  ruleName?: string;
+  /** 提示词来自哪个版本：A(资料库关联)/B(AI推荐)/C(自定义模板)，用于生图任务页分组 */
+  version?: 'A' | 'B' | 'C';
 }
 
 /* 生图提交响应 */
@@ -424,10 +428,14 @@ function calcRatioText(w: number, h: number): string {
  */
 function ImageGenSection({
   ruleId,
+  ruleName,
+  version,
   promptPositive,
   promptNegative,
 }: {
   ruleId: string;
+  ruleName?: string;
+  version?: 'A' | 'B' | 'C';
   promptPositive: string;
   promptNegative: string;
 }) {
@@ -571,6 +579,8 @@ function ImageGenSection({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiPost<any>('/api/gen/submit', {
         rule_id: ruleId,
+        rule_name: ruleName || '',
+        version: version || '',
         prompt_positive: promptPositive,
         prompt_negative: promptNegative,
         width: submitWidth,
@@ -760,7 +770,7 @@ function ImageGenSection({
   );
 }
 
-export default function PromptDisplay({ result, ruleId }: PromptDisplayProps) {
+export default function PromptDisplay({ result, ruleId, ruleName, version }: PromptDisplayProps) {
   return (
     <div className="space-y-4 mt-3">
       {/* 🔒 核心卖点锁定区域 */}
@@ -904,6 +914,8 @@ export default function PromptDisplay({ result, ruleId }: PromptDisplayProps) {
       {ruleId && (
         <ImageGenSection
           ruleId={ruleId}
+          ruleName={ruleName}
+          version={version}
           promptPositive={result.image_prompt_positive}
           promptNegative={result.image_prompt_negative}
         />

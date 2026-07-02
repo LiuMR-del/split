@@ -131,7 +131,14 @@ export default function PromptVersionB({ ruleId, ruleCard }: PromptVersionBProps
       )}
 
       {/* 生成结果展示 */}
-      {result && <PromptDisplay result={result} ruleId={ruleId} />}
+      {result && (
+        <PromptDisplay
+          result={result}
+          ruleId={ruleId}
+          ruleName={ruleCard?.rule_name}
+          version="B"
+        />
+      )}
     </div>
   );
 }

@@ -56,9 +56,6 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
   /* 生成结果 */
   const [result, setResult] = useState<PromptResult | null>(null);
 
-  // 标记 ruleCard 为已使用（props 中需要传递以保持接口一致）
-  void ruleCard;
-
   /* 加载模板结构 */
   useEffect(() => {
     async function loadTemplate() {
@@ -300,7 +297,14 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
       )}
 
       {/* 生成结果展示 */}
-      {result && <PromptDisplay result={result} ruleId={ruleId} />}
+      {result && (
+        <PromptDisplay
+          result={result}
+          ruleId={ruleId}
+          ruleName={ruleCard?.rule_name}
+          version="C"
+        />
+      )}
     </div>
   );
 }

@@ -9,6 +9,7 @@
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional, List
 
@@ -22,6 +23,13 @@ GEN_DIR = DATA_DIR / "gen"
 GEN_TASKS_DIR = GEN_DIR / "tasks"
 GEN_IMAGES_DIR = GEN_DIR / "images"
 DB_PATH = DATA_DIR / "rules.db"  # 复用已有的 SQLite 数据库文件
+
+# 生成任务 ID 时用的进程内锁：
+# generate_task_id() 原本是"读当前最大编号 -> 算下一个"两步分离，
+# 如果两个请求在第一个请求写入数据库之前都执行了"读"，会算出同一个编号，
+# 导致后写入的任务把先写入的覆盖掉（版本B和版本C几乎同时点生成时复现过）。
+# 用锁把"生成编号"和"用占位文件占住这个编号"合并成一步，杜绝这个竞态。
+_task_id_lock = threading.Lock()
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -45,6 +53,8 @@ def init_image_gen_db():
             task_id TEXT UNIQUE NOT NULL,
             out_task_id TEXT NOT NULL,
             rule_id TEXT NOT NULL,
+            rule_name TEXT DEFAULT '',
+            version TEXT DEFAULT '',
             status TEXT NOT NULL DEFAULT 'pending',
             prompt_positive TEXT DEFAULT '',
             prompt_negative TEXT DEFAULT '',
@@ -59,6 +69,12 @@ def init_image_gen_db():
             json_path TEXT NOT NULL
         )
     """)
+    # 兼容已有数据库：旧表可能没有 rule_name/version 列，用 ALTER TABLE 补上
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(image_gen_tasks)").fetchall()}
+    if "rule_name" not in existing_cols:
+        conn.execute("ALTER TABLE image_gen_tasks ADD COLUMN rule_name TEXT DEFAULT ''")
+    if "version" not in existing_cols:
+        conn.execute("ALTER TABLE image_gen_tasks ADD COLUMN version TEXT DEFAULT ''")
     # 创建索引加速查询
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_gen_tasks_rule_id
@@ -89,14 +105,16 @@ def save_task(task: ImageGenTask) -> None:
     conn = _get_connection()
     conn.execute("""
         INSERT OR REPLACE INTO image_gen_tasks
-        (task_id, out_task_id, rule_id, status, prompt_positive, prompt_negative,
+        (task_id, out_task_id, rule_id, rule_name, version, status, prompt_positive, prompt_negative,
          width, height, image_urls, local_images, error, estimated_credits,
          created_at, completed_at, json_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         task.task_id,
         task.out_task_id,
         task.rule_id,
+        task.rule_name,
+        task.version,
         task.status,
         task.prompt_positive,
         task.prompt_negative,
@@ -115,13 +133,22 @@ def save_task(task: ImageGenTask) -> None:
 
 
 def get_task(task_id: str) -> Optional[ImageGenTask]:
-    """读取单个生图任务"""
+    """读取单个生图任务
+
+    如果该 task_id 目前还只是 generate_task_id() 创建的占位文件
+    （真正的任务数据还没被 save_task() 写入），返回 None，
+    调用方应视为"任务不存在/尚未就绪"，不要当成一个空任务处理。
+    """
     json_path = GEN_TASKS_DIR / f"{task_id}.json"
     if not json_path.exists():
         return None
 
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    if data.get("_placeholder"):
+        return None
+
     return ImageGenTask(**data)
 
 
@@ -192,7 +219,7 @@ def list_tasks(
     # 分页查询
     offset = (page - 1) * page_size
     query_sql = f"""
-        SELECT task_id, out_task_id, rule_id, status,
+        SELECT task_id, out_task_id, rule_id, rule_name, version, status,
                prompt_positive, prompt_negative, width, height,
                image_urls, local_images, error, estimated_credits,
                created_at, completed_at
@@ -212,6 +239,8 @@ def list_tasks(
             "task_id": row["task_id"],
             "out_task_id": row["out_task_id"],
             "rule_id": row["rule_id"],
+            "rule_name": row["rule_name"] or "",
+            "version": row["version"] or "",
             "status": row["status"],
             "prompt_positive": row["prompt_positive"],
             "prompt_negative": row["prompt_negative"],
@@ -333,36 +362,49 @@ async def download_images(task_id: str) -> List[str]:
 
 def generate_task_id() -> str:
     """
-    生成下一个任务 ID（GEN-0001 递增格式）。
-    查询 SQLite 获取当前最大编号。
+    生成下一个任务 ID（GEN-0001 递增格式），并立刻创建占位 JSON 文件占住这个编号。
+
+    "读取最大编号"和"占用编号"合并在同一把锁内完成：
+    没有这把锁的话，两个几乎同时到达的请求都可能在对方写入数据库/占位文件之前
+    读到同一个"当前最大编号"，从而算出同一个 task_id，后完成的一次会直接覆盖
+    先完成的那次结果（版本B和版本C同时点"生成图片"时复现过）。
+
+    占位文件内容是 {"task_id": ..., "_placeholder": true}，
+    调用方（submit_gen_task）随后会用 save_task() 写入真正的任务数据覆盖占位内容；
+    get_task() 对占位文件返回 None，避免调用方读到半成品数据。
     """
-    conn = _get_connection()
+    with _task_id_lock:
+        conn = _get_connection()
 
-    # 查询当前最大 task_id
-    row = conn.execute(
-        "SELECT task_id FROM image_gen_tasks ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
+        # 查询当前最大 task_id（数据库里的 + 占位文件里的，取较大值）
+        row = conn.execute(
+            "SELECT task_id FROM image_gen_tasks ORDER BY id DESC LIMIT 1"
+        ).fetchone()
 
-    if row:
-        current_id = row["task_id"]
-        try:
-            num = int(current_id.split("-")[1])
-            return f"GEN-{num + 1:04d}"
-        except (IndexError, ValueError):
-            pass
+        max_num = 0
+        if row:
+            try:
+                max_num = int(row["task_id"].split("-")[1])
+            except (IndexError, ValueError):
+                pass
 
-    # 如果数据库为空或解析失败，检查目录中的 JSON 文件
-    existing = list(GEN_TASKS_DIR.glob("GEN-*.json"))
-    if existing:
-        nums = []
-        for f in existing:
+        # 数据库为空或解析失败时，也检查目录中已有的 JSON 文件（含占位文件）
+        GEN_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        for f in GEN_TASKS_DIR.glob("GEN-*.json"):
             try:
                 num = int(f.stem.split("-")[1])
-                nums.append(num)
+                max_num = max(max_num, num)
             except (IndexError, ValueError):
                 continue
-        if nums:
-            return f"GEN-{max(nums) + 1:04d}"
 
-    return "GEN-0001"
+        conn.close()
+
+        next_id = f"GEN-{max_num + 1:04d}"
+
+        # 立刻创建占位文件，占住这个编号 —— 锁释放后，
+        # 下一个并发请求的 glob 扫描会看到这个文件，不会再算出同一个编号
+        placeholder_path = GEN_TASKS_DIR / f"{next_id}.json"
+        with open(placeholder_path, "w", encoding="utf-8") as f:
+            json.dump({"task_id": next_id, "_placeholder": True}, f)
+
+        return next_id

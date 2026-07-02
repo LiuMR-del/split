@@ -164,6 +164,8 @@ async def submit_gen_task(request: ImageGenRequest):
                 task_id=task_id,
                 out_task_id=result["out_task_id"],
                 rule_id=request.rule_id,
+                rule_name=request.rule_name,
+                version=request.version,
                 status="completed" if is_sync_completed else result.get("status", "pending"),
                 prompt_positive=request.prompt_positive,
                 prompt_negative=request.prompt_negative,

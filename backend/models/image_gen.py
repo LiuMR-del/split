@@ -18,6 +18,8 @@ class ImageGenConfig(BaseModel):
 class ImageGenRequest(BaseModel):
     """生图请求"""
     rule_id: str = Field(description="基于哪条规则")
+    rule_name: str = Field(default="", description="规则名称（提交时冗余存一份，生图任务页按规则分组展示时不用再反查）")
+    version: str = Field(default="", description="提示词来自哪个版本：A(资料库关联)/B(AI推荐)/C(自定义模板)，旧数据/未传时为空")
     prompt_positive: str = Field(description="正向提示词")
     prompt_negative: str = Field(default="", description="负向提示词")
     width: int = Field(default=1024, description="宽度")
@@ -30,6 +32,8 @@ class ImageGenTask(BaseModel):
     task_id: str = Field(description="本地任务ID")
     out_task_id: str = Field(description="远端任务ID")
     rule_id: str = Field(description="关联规则")
+    rule_name: str = Field(default="", description="规则名称")
+    version: str = Field(default="", description="来源提示词版本：A/B/C，旧数据为空")
     status: str = Field(description="pending/processing/completed/failed")
     prompt_positive: str
     prompt_negative: str
