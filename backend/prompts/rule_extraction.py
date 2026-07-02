@@ -106,13 +106,18 @@ def get_rule_extraction_prompt() -> str:
 - **must_not_change**：绝对不能替换的元素列表
 
 ### 第 4 层：产品适配层（layer_4_product）
-首先判断这张竞品图本身是什么产品（如毛毯、T恤、相框等），然后分析如何适配到各种 POD 产品。
+首先仔细观察这张竞品图本身实际上是印在什么产品上的（是毛毯照片？T恤实拍？装裱好的相框/挂画？马克杯？沙滩巾？），然后分析如何适配到其他 POD 产品。
 
 **重要**：
-1. 必须先识别竞品图的原产品类型，将其作为 adaptations 的第一个 key
+1. **必须先如实识别竞品图的原产品类型，将其作为 adaptations 的第一个 key**——这是本层最容易出错的地方，禁止不假思索地默认填"Blanket 毛毯"，必须真正观察图片内容后再判断。
+   - 如果图中有画框/裱框效果、悬挂展示或标注了"PRINTED + FRAMED"等字样 → 产品是 Frame 相框（并根据画面比例进一步判断是 Frame 横板 相框 还是 Frame 竖版 相框）
+   - 如果图中是叠起来的织物、盖在人身上或床上 → Blanket 毛毯
+   - 如果是人穿在身上的印花 → T-Shirt T恤 或 Hoodie 卫衣
+   - 如果是圆柱形容器 → Mug 马克杯 或 Tumbler 保温杯
+   - 其余情况根据画面实际呈现的载体判断，不要套用固定答案
 2. 原产品类型的适配说明写"当前竞品图即为此产品，直接适用"
-3. 常见 POD 产品类型：Blanket 毛毯、T-Shirt T恤、Hoodie 卫衣、Mug 马克杯、Tote Bag 手提包、Phone Case 手机壳、Poster 海报、Canvas 挂画、Pillow 抱枕、Beach Towel 沙滩巾、Tumbler 保温杯
-4. 至少列出 4 种产品的适配方案（含原产品）
+3. 常见 POD 产品类型：Blanket 毛毯、T-Shirt T恤、Hoodie 卫衣、Mug 马克杯、Tote Bag 手提包、Phone Case 手机壳、Poster 海报、Frame 横板相框、Frame 竖版相框、Canvas 挂画、Pillow 抱枕、Beach Towel 沙滩巾、Tumbler 保温杯
+4. 至少列出 4 种产品的适配方案（含原产品），且第一个 key 必须与你实际观察到的原产品一致，不能与后续的其他适配产品重复
 
 - **adaptations**：产品适配字典，第一个 key 必须是竞品图的原产品类型，后面是其他可适配的产品。每个 value 包含：
   - canvas_ratio：画布比例
@@ -165,10 +170,10 @@ def get_rule_extraction_prompt() -> str:
   }},
   "layer_4_product": {{
     "adaptations": {{
-      "Blanket 毛毯": {{"canvas_ratio": "3:4", "adaptation_notes": "当前竞品图即为此产品，直接适用", "simplify": [], "enhance": []}},
-      "T-Shirt T恤": {{"canvas_ratio": "根据印花区域", "adaptation_notes": "...", "simplify": [], "enhance": []}},
-      "Mug 马克杯": {{"canvas_ratio": "环绕横幅", "adaptation_notes": "...", "simplify": [], "enhance": []}},
-      "Poster 海报": {{"canvas_ratio": "2:3", "adaptation_notes": "...", "simplify": [], "enhance": []}}
+      "【竞品图本身的产品类型，如实填写，例如可能是 Frame 相框 / Blanket 毛毯 / T-Shirt T恤 / Mug 马克杯 / Poster 海报 / Beach Towel 沙滩巾 等——必须是你从图片实际内容判断出的产品，不要照抄本示例】": {{"canvas_ratio": "如实填写该产品的画布比例", "adaptation_notes": "当前竞品图即为此产品，直接适用", "simplify": [], "enhance": []}},
+      "【其他适配产品2，从上面第114条常见POD产品类型列表中选择，不要与第一个key相同】": {{"canvas_ratio": "...", "adaptation_notes": "...", "simplify": [], "enhance": []}},
+      "【其他适配产品3】": {{"canvas_ratio": "...", "adaptation_notes": "...", "simplify": [], "enhance": []}},
+      "【其他适配产品4】": {{"canvas_ratio": "...", "adaptation_notes": "...", "simplify": [], "enhance": []}}
     }}
   }},
   "layer_5_data": {{

@@ -14,7 +14,7 @@
 import { useState, useEffect } from 'react';
 import { apiPost, getImageUrl, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
-import Select from '@/components/ui/Select';
+import ProductSelect, { getProductOptionsFromRuleCard } from '@/components/prompts/ProductSelect';
 import Card from '@/components/ui/Card';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
 import Link from 'next/link';
@@ -115,23 +115,8 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
     }
   }, [ruleId]);
 
-  /* ── 从 ruleCard 获取产品选项（同版本 B 逻辑） ── */
-  const getProductOptions = () => {
-    const adaptations = ruleCard?.layer_4_product?.adaptations;
-    if (!adaptations || typeof adaptations !== 'object') {
-      return [
-        { label: 'Blanket 毛毯', value: 'Blanket 毛毯' },
-        { label: 'T-Shirt T恤', value: 'T-Shirt T恤' },
-        { label: 'Mug 马克杯', value: 'Mug 马克杯' },
-        { label: 'Poster 海报', value: 'Poster 海报' },
-      ];
-    }
-    return Object.keys(adaptations).map((key) => ({
-      label: key,
-      value: key,
-    }));
-  };
-  const productOptions = getProductOptions();
+  /* ── 从 ruleCard 获取产品选项（与版本 B 共用同一份逻辑，见 ProductSelect） ── */
+  const productOptions = getProductOptionsFromRuleCard(ruleCard);
 
   /* ── 切换图片选中 ── */
   const toggleSelect = (id: string) => {
@@ -415,12 +400,8 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
 
       {/* ── 目标产品下拉 ── */}
       <div>
-        <Select
-          label="&#127919; 目标产品"
-          options={[
-            { label: '— 请选择目标产品 —', value: '' },
-            ...productOptions,
-          ]}
+        <ProductSelect
+          options={productOptions}
           value={targetProduct}
           onChange={setTargetProduct}
         />

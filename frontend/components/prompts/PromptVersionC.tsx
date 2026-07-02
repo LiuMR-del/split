@@ -10,6 +10,7 @@ import { apiGet, apiPost, unwrapData } from '@/lib/api';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import Card from '@/components/ui/Card';
+import ProductSelect from '@/components/prompts/ProductSelect';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
 
 interface PromptVersionCProps {
@@ -255,12 +256,8 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
       {/* 目标产品 + 生成按钮 —— 窄栏内垂直排列 */}
       <div className="flex flex-col gap-2 pt-2 border-t border-codex-border">
         <div className="flex-1 w-full">
-          <Select
-            label="🎯 目标产品"
-            options={[
-              { label: '— 请选择目标产品 —', value: '' },
-              ...(template.product_options || []),
-            ]}
+          <ProductSelect
+            options={template.product_options || []}
             value={targetProduct}
             onChange={setTargetProduct}
           />
