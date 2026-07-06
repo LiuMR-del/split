@@ -44,6 +44,8 @@ cd backend && python3 seed_rules.py
 - **图片格式兼容（单一事实来源）**: `services/image_format_utils.py` 统一定义 `UPLOAD_ACCEPTED_MIME_TYPES`（上传白名单）和 `VLM_SUPPORTED_FORMATS`（VLM 原生支持，其余走 Pillow 转 JPEG），`prepare_image_for_vlm()` 供 `image_analyzer.py`/`image_tagger.py` 共用。新增格式只改这一个文件
 - **AI 响应 JSON 提取**: 统一用 `services/ai_response_utils.py` 的 `extract_json_from_ai_response()`（三级策略：直接解析 → ```json 代码块 → 首尾花括号），不要每个模块各写一份
 - **AI 客户端加载**: 路由里要拿 `AIClient` 统一调 `services/ai_client.py` 的 `load_ai_client_from_config()`，不要各自重复读 config.json
+- **递增 ID 生成**: 必须"扫描已有文件解析编号、取最大值 +1"，不能"数文件数量 +1"——序列中间任意一条被删除后，数量会永久比最大编号少 1，之后每次新建都会撞上仍然存在的旧编号且无法自愈（`rule_store`/`image_gen_store` 都吃过这个亏，见 `image_analyzer._generate_rule_id()` 和 `image_gen_store.generate_task_id()` 的写法）。并发场景（同一时刻多个请求都要生成新 ID）还需要额外加锁 + 占位文件，见 `image_gen_store.generate_task_id()`
+- **VLM 提示词里的 JSON 输出示例不能给具体值**：给 VLM 看的 `{"层字段": "示例值"}` 会被模式匹配抄写，而不是引导它去读图——`layer_4_product.adaptations` 曾经因为示例写死 `"Blanket 毛毯"` 导致 VLM 无论竞品图是什么都固定输出这四个产品。写分析类 prompt 的 JSON 示例，可变的字段要用方括号占位符描述"这里要填什么、怎么判断"，不能写成看起来像正确答案的具体值
 
 ### 前端
 
@@ -55,8 +57,8 @@ cd backend && python3 seed_rules.py
 
 ### 核心业务概念
 
-- **规则卡 6 层**: 第 0 层核心卖点锚定（最高优先级，绝不可替换）→ 第 1 层商业层 → 第 2 层视觉结构 → 第 3 层可变边界 → 第 4 层产品适配（第一个 key 必须是竞品图原产品类型）→ 第 5 层数据验证（SABC 分级）
-- **提示词三版（三栏并排，各自独立操作）**:
+- **规则卡 6 层**: 第 0 层核心卖点锚定（最高优先级，绝不可替换）→ 第 1 层商业层 → 第 2 层视觉结构 → 第 3 层可变边界 → 第 4 层产品适配（第一个 key 必须是竞品图本身的真实产品类型，按画面线索判断——裱框/悬挂→相框、穿着→T恤/卫衣、圆柱容器→马克杯，而非默认毛毯）→ 第 5 层数据验证（SABC 分级）
+- **提示词三版（三栏并排，各自独立操作，目标产品下拉框统一用 `PromptVersionA/B/C` 共用的 `ProductSelect` 组件，支持"自定义"手动填产品名，兜底 AI 分析漏判/列不全的情况）**:
   - 版本 A（资料库关联）: 以核心卖点为锚点 → 两轮匹配（核心过滤+分维度加权 Jaccard：风格35%/色彩20%/构图20%/主题15%/情绪10%）→ 用户选参考图 → 独立后端接口 `POST /api/prompts/generate-a` 结构化融合
   - 版本 B（AI 推荐）: AI 自主推荐改款方向，与图库无关，不包含参考图推荐
   - 版本 C（自定义模板）: 下拉框选项+自定义输入
@@ -70,6 +72,6 @@ cd backend && python3 seed_rules.py
 - 规则卡 6 层类型定义在 RuleCardPreview 和 RuleCardEditor 中各自独立定义，应抽取共享
 - `image_library_store.py` 的 SQLite 行转字典逻辑在 `list_images`/`recommend_for_rule` 里各写一份，可抽共享函数
 - `image_analyzer.py`/`image_tagger.py`/`routers/library.py` 里同步 Pillow/文件 IO 直接跑在 async 路由里，未 `asyncio.to_thread` 化，量大时会阻塞事件循环
-- 三个 `PromptVersion*.tsx` 组件重复"调接口 → setResult → 渲染 PromptDisplay"的样板逻辑，可抽 `useGeneratePrompt` hook
+- 三个 `PromptVersion*.tsx` 组件仍各自重复"调接口 → setResult → 渲染 PromptDisplay"的样板逻辑（目标产品下拉框已抽成 `ProductSelect` 共享，其余部分未抽），可再抽 `useGeneratePrompt` hook
 - `recommend_for_rule` 每次请求全表扫描图库无缓存，规则侧字段在每次循环内重复解析
 - `_extract_core_keywords` 用简单中文分词+硬编码停用词表，匹配质量有限，考虑接入更专业的分词
