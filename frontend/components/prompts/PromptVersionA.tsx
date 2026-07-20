@@ -17,7 +17,11 @@ import Button from '@/components/ui/Button';
 import ProductSelect, { getProductOptionsFromRuleCard } from '@/components/prompts/ProductSelect';
 import Card from '@/components/ui/Card';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
+import CollapsibleSection from '@/components/ui/CollapsibleSection';
 import Link from 'next/link';
+
+/* 二期批次一：界面精简开关，改 true 恢复显示 */
+const SHOW_INFO_CARDS = false;
 
 /* ── 推荐图片条目类型 ── */
 interface RecommendedImage {
@@ -79,6 +83,9 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<PromptResult | null>(null);
+  /* 配置区折叠状态：默认展开，生成成功后自动收起；点击标题栏可重新展开调整
+   * （交互与"中文结构化提示词"一致：点标题栏切换，箭头旋转） */
+  const [configExpanded, setConfigExpanded] = useState(true);
 
   /* ── 提取核心卖点文字 ── */
   const coreSellingPoint: string =
@@ -169,6 +176,8 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
         reference_image_ids: Array.from(selectedIds),
       });
       setResult(unwrapData(res));
+      /* 生成成功后配置区自动收起，聚焦到下方生图提示词 */
+      setConfigExpanded(false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : '生成失败';
       setError(msg);
@@ -209,7 +218,7 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
   return (
     <div className="space-y-3">
       {/* ── 核心卖点锚点卡片 ── */}
-      {coreSellingPoint && (
+      {SHOW_INFO_CARDS && coreSellingPoint && (
         <Card className="border-l-4 border-l-orange-500 bg-codex-card">
           <h4 className="text-xs font-mono font-bold text-orange-400 mb-1">
             &#128204; 核心卖点
@@ -223,222 +232,231 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
         </Card>
       )}
 
-      {/* ── 加载中 ── */}
-      {loadingImages && (
-        <div className="flex items-center justify-center py-8">
-          <div className="flex flex-col items-center gap-3">
-            <span className="inline-block w-6 h-6 border-2 border-codex-accent border-t-transparent rounded-full animate-spin" />
-            <p className="text-xs font-mono text-codex-text-secondary">
-              正在从图库检索匹配图片...
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* ── 加载失败 ── */}
-      {imageError && (
-        <div className="px-4 py-2 bg-red-900/20 border border-codex-danger rounded-md">
-          <p className="text-sm font-mono text-codex-danger">&#10060; {imageError}</p>
-        </div>
-      )}
-
-      {/* ── 推荐参考图网格 ── */}
-      {!loadingImages && images.length > 0 && (
-        <>
-          <h3 className="text-sm font-mono font-bold text-codex-text">
-            &#128247; 推荐参考图（基于核心卖点匹配）
-            <span className="text-codex-text-secondary font-normal ml-2">
-              共找到 {images.length} 张
-            </span>
-          </h3>
-
-          {/* 网格 —— 窄栏两列 */}
-          <div className="grid grid-cols-2 gap-3">
-            {images.map((img) => {
-              const thumbUrl = img.thumbnail_path
-                ? getImageUrl(img.thumbnail_path)
-                : null;
-              const isSelected = selectedIds.has(img.image_id);
-              const isDisabled = !isSelected && selectedIds.size >= MAX_SELECT;
-              const isExpanded = expandedIds.has(img.image_id);
-              const hasDimensions = !!img.match_details;
-
-              return (
-                <div
-                  key={img.image_id}
-                  className={`
-                    relative bg-codex-bg border rounded-md overflow-hidden
-                    transition-all duration-200
-                    ${isSelected
-                      ? 'border-codex-accent shadow-md shadow-codex-accent/20 ring-1 ring-codex-accent/40'
-                      : isDisabled
-                        ? 'border-codex-border opacity-50 cursor-not-allowed'
-                        : 'border-codex-border hover:border-codex-accent/50 cursor-pointer'
-                    }
-                  `}
-                  onClick={() => {
-                    if (!isDisabled) toggleSelect(img.image_id);
-                  }}
-                >
-                  {/* 勾选框 */}
-                  <div
-                    className={`
-                      absolute top-1.5 left-1.5 z-10
-                      w-5 h-5 rounded border-2 flex items-center justify-center
-                      transition-colors duration-150
-                      ${isSelected
-                        ? 'bg-codex-accent border-codex-accent'
-                        : 'bg-codex-bg/70 border-codex-text-secondary/50'
-                      }
-                    `}
-                  >
-                    {isSelected && (
-                      <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                      </svg>
-                    )}
-                  </div>
-
-                  {/* 缩略图 */}
-                  <div className="w-full h-28 bg-codex-bg flex items-center justify-center overflow-hidden">
-                    {thumbUrl ? (
-                      <img
-                        src={thumbUrl}
-                        alt={img.filename || img.image_id}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <span className="text-2xl text-codex-text-secondary">&#128247;</span>
-                    )}
-                  </div>
-
-                  {/* 底部信息 */}
-                  <div className="p-2 space-y-1">
-                    {/* 图片 ID */}
-                    <p className="text-[10px] font-mono text-codex-text-secondary truncate">
-                      {img.filename || img.image_id}
-                    </p>
-
-                    {/* 综合分数 */}
-                    {img.score !== undefined && (
-                      <p className="text-xs font-mono font-bold text-codex-accent">
-                        综合 {img.score.toFixed(2)}
-                      </p>
-                    )}
-
-                    {/* 核心匹配标记 */}
-                    {img.core_matched && (
-                      <span className="inline-block text-[10px] font-mono text-green-400">
-                        &#9989; 核心相关
-                      </span>
-                    )}
-
-                    {/* 维度详情展开按钮 */}
-                    {hasDimensions && (
-                      <button
-                        className="flex items-center gap-1 text-[10px] font-mono text-codex-text-secondary hover:text-codex-accent transition-colors cursor-pointer"
-                        onClick={(e) => {
-                          e.stopPropagation(); /* 不触发卡片选中 */
-                          toggleExpand(img.image_id);
-                        }}
-                      >
-                        &#128202; 详情
-                        <span className={`transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`}>
-                          &#9660;
-                        </span>
-                      </button>
-                    )}
-
-                    {/* 维度分数条（展开后显示） */}
-                    {isExpanded && img.match_details && (
-                      <div className="space-y-1 pt-1">
-                        {DIMENSION_CONFIG.map((dim) => {
-                          const val = (img.match_details as Record<string, number | undefined>)[dim.key] ?? 0;
-                          const pct = Math.min(Math.max(val * 100, 0), 100);
-                          return (
-                            <div key={dim.key} className="flex items-center gap-1.5">
-                              <span className="text-[9px] font-mono text-codex-text-secondary w-6 shrink-0">
-                                {dim.label}
-                              </span>
-                              {/* 进度条背景 */}
-                              <div className="flex-1 h-1.5 bg-codex-border rounded-full overflow-hidden">
-                                <div
-                                  className="h-full bg-codex-accent rounded-full transition-all duration-300"
-                                  style={{ width: `${pct}%` }}
-                                />
-                              </div>
-                              <span className="text-[9px] font-mono text-codex-text-secondary w-7 text-right shrink-0">
-                                {val.toFixed(2)}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {/* 匹配原因 */}
-                    {img.match_reason && (
-                      <p className="text-[10px] font-mono text-codex-text-secondary leading-tight line-clamp-2">
-                        {img.match_reason}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* 已选提示 */}
-          <p className="text-xs font-mono text-codex-text-secondary">
-            已选择{' '}
-            <span className="text-codex-accent font-bold">{selectedIds.size}</span>{' '}
-            张参考图
-            {selectedIds.size >= MAX_SELECT && (
-              <span className="text-codex-warning ml-1">（已达上限 {MAX_SELECT} 张）</span>
-            )}
-          </p>
-        </>
-      )}
-
-      {/* ── 目标产品下拉 ── */}
-      <div>
-        <ProductSelect
-          options={productOptions}
-          value={targetProduct}
-          onChange={setTargetProduct}
-        />
-      </div>
-
-      {/* ── 生成按钮 ── */}
-      <Button
-        variant="primary"
-        size="sm"
-        onClick={handleGenerate}
-        loading={loading}
-        disabled={selectedIds.size === 0 || !targetProduct}
-        className="w-full"
+      {/* 配置区：加载中/失败提示 + 推荐参考图网格 + 目标产品 + 生成按钮。
+          折叠交互与"中文结构化提示词"一致（点标题栏展开/收起）；生成成功后自动收起，
+          点击标题栏可重新展开调整并重新生成。 */}
+      <CollapsibleSection
+        title="🔧 参考图 & 目标产品"
+        expanded={configExpanded}
+        onExpandedChange={setConfigExpanded}
       >
-        &#127912; 基于参考图生成提示词
-      </Button>
+          {/* ── 加载中 ── */}
+          {loadingImages && (
+            <div className="flex items-center justify-center py-8">
+              <div className="flex flex-col items-center gap-3">
+                <span className="inline-block w-6 h-6 border-2 border-codex-accent border-t-transparent rounded-full animate-spin" />
+                <p className="text-xs font-mono text-codex-text-secondary">
+                  正在从图库检索匹配图片...
+                </p>
+              </div>
+            </div>
+          )}
 
-      {/* ── 错误提示 ── */}
-      {error && (
-        <div className="px-4 py-2 bg-red-900/20 border border-codex-danger rounded-md">
-          <p className="text-sm font-mono text-codex-danger">&#10060; {error}</p>
-        </div>
-      )}
+          {/* ── 加载失败 ── */}
+          {imageError && (
+            <div className="px-4 py-2 bg-red-900/20 border border-codex-danger rounded-md">
+              <p className="text-sm font-mono text-codex-danger">&#10060; {imageError}</p>
+            </div>
+          )}
 
-      {/* ── 加载动画 ── */}
-      {loading && (
-        <div className="flex items-center justify-center py-8">
-          <div className="flex flex-col items-center gap-3">
-            <span className="inline-block w-8 h-8 border-3 border-codex-accent border-t-transparent rounded-full animate-spin" />
-            <p className="text-sm font-mono text-codex-text-secondary">
-              正在基于参考图生成提示词...
-            </p>
+          {/* ── 推荐参考图网格 ── */}
+          {!loadingImages && images.length > 0 && (
+            <>
+              <h3 className="text-sm font-mono font-bold text-codex-text">
+                &#128247; 推荐参考图（基于核心卖点匹配）
+                <span className="text-codex-text-secondary font-normal ml-2">
+                  共找到 {images.length} 张
+                </span>
+              </h3>
+
+              {/* 网格 —— 窄栏两列 */}
+              <div className="grid grid-cols-2 gap-3">
+                {images.map((img) => {
+                  const thumbUrl = img.thumbnail_path
+                    ? getImageUrl(img.thumbnail_path)
+                    : null;
+                  const isSelected = selectedIds.has(img.image_id);
+                  const isDisabled = !isSelected && selectedIds.size >= MAX_SELECT;
+                  const isExpanded = expandedIds.has(img.image_id);
+                  const hasDimensions = !!img.match_details;
+
+                  return (
+                    <div
+                      key={img.image_id}
+                      className={`
+                        relative bg-codex-bg border rounded-md overflow-hidden
+                        transition-all duration-200
+                        ${isSelected
+                          ? 'border-codex-accent shadow-md shadow-codex-accent/20 ring-1 ring-codex-accent/40'
+                          : isDisabled
+                            ? 'border-codex-border opacity-50 cursor-not-allowed'
+                            : 'border-codex-border hover:border-codex-accent/50 cursor-pointer'
+                        }
+                      `}
+                      onClick={() => {
+                        if (!isDisabled) toggleSelect(img.image_id);
+                      }}
+                    >
+                      {/* 勾选框 */}
+                      <div
+                        className={`
+                          absolute top-1.5 left-1.5 z-10
+                          w-5 h-5 rounded border-2 flex items-center justify-center
+                          transition-colors duration-150
+                          ${isSelected
+                            ? 'bg-codex-accent border-codex-accent'
+                            : 'bg-codex-bg/70 border-codex-text-secondary/50'
+                          }
+                        `}
+                      >
+                        {isSelected && (
+                          <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                          </svg>
+                        )}
+                      </div>
+
+                      {/* 缩略图 */}
+                      <div className="w-full h-28 bg-codex-bg flex items-center justify-center overflow-hidden">
+                        {thumbUrl ? (
+                          <img
+                            src={thumbUrl}
+                            alt={img.filename || img.image_id}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <span className="text-2xl text-codex-text-secondary">&#128247;</span>
+                        )}
+                      </div>
+
+                      {/* 底部信息 */}
+                      <div className="p-2 space-y-1">
+                        {/* 图片 ID */}
+                        <p className="text-[10px] font-mono text-codex-text-secondary truncate">
+                          {img.filename || img.image_id}
+                        </p>
+
+                        {/* 综合分数 */}
+                        {img.score !== undefined && (
+                          <p className="text-xs font-mono font-bold text-codex-accent">
+                            综合 {img.score.toFixed(2)}
+                          </p>
+                        )}
+
+                        {/* 核心匹配标记 */}
+                        {img.core_matched && (
+                          <span className="inline-block text-[10px] font-mono text-green-400">
+                            &#9989; 核心相关
+                          </span>
+                        )}
+
+                        {/* 维度详情展开按钮 */}
+                        {hasDimensions && (
+                          <button
+                            className="flex items-center gap-1 text-[10px] font-mono text-codex-text-secondary hover:text-codex-accent transition-colors cursor-pointer"
+                            onClick={(e) => {
+                              e.stopPropagation(); /* 不触发卡片选中 */
+                              toggleExpand(img.image_id);
+                            }}
+                          >
+                            &#128202; 详情
+                            <span className={`transition-transform duration-150 ${isExpanded ? 'rotate-180' : ''}`}>
+                              &#9660;
+                            </span>
+                          </button>
+                        )}
+
+                        {/* 维度分数条（展开后显示） */}
+                        {isExpanded && img.match_details && (
+                          <div className="space-y-1 pt-1">
+                            {DIMENSION_CONFIG.map((dim) => {
+                              const val = (img.match_details as Record<string, number | undefined>)[dim.key] ?? 0;
+                              const pct = Math.min(Math.max(val * 100, 0), 100);
+                              return (
+                                <div key={dim.key} className="flex items-center gap-1.5">
+                                  <span className="text-[9px] font-mono text-codex-text-secondary w-6 shrink-0">
+                                    {dim.label}
+                                  </span>
+                                  {/* 进度条背景 */}
+                                  <div className="flex-1 h-1.5 bg-codex-border rounded-full overflow-hidden">
+                                    <div
+                                      className="h-full bg-codex-accent rounded-full transition-all duration-300"
+                                      style={{ width: `${pct}%` }}
+                                    />
+                                  </div>
+                                  <span className="text-[9px] font-mono text-codex-text-secondary w-7 text-right shrink-0">
+                                    {val.toFixed(2)}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* 匹配原因 */}
+                        {img.match_reason && (
+                          <p className="text-[10px] font-mono text-codex-text-secondary leading-tight line-clamp-2">
+                            {img.match_reason}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* 已选提示 */}
+              <p className="text-xs font-mono text-codex-text-secondary">
+                已选择{' '}
+                <span className="text-codex-accent font-bold">{selectedIds.size}</span>{' '}
+                张参考图
+                {selectedIds.size >= MAX_SELECT && (
+                  <span className="text-codex-warning ml-1">（已达上限 {MAX_SELECT} 张）</span>
+                )}
+              </p>
+            </>
+          )}
+
+          {/* ── 目标产品下拉 ── */}
+          <div>
+            <ProductSelect
+              options={productOptions}
+              value={targetProduct}
+              onChange={setTargetProduct}
+            />
           </div>
-        </div>
-      )}
+
+          {/* ── 生成按钮 ── */}
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleGenerate}
+            loading={loading}
+            disabled={selectedIds.size === 0 || !targetProduct}
+            className="w-full"
+          >
+            &#127912; 基于参考图生成提示词
+          </Button>
+
+          {/* ── 错误提示 ── */}
+          {error && (
+            <div className="px-4 py-2 bg-red-900/20 border border-codex-danger rounded-md">
+              <p className="text-sm font-mono text-codex-danger">&#10060; {error}</p>
+            </div>
+          )}
+
+          {/* ── 加载动画 ── */}
+          {loading && (
+            <div className="flex items-center justify-center py-8">
+              <div className="flex flex-col items-center gap-3">
+                <span className="inline-block w-8 h-8 border-3 border-codex-accent border-t-transparent rounded-full animate-spin" />
+                <p className="text-sm font-mono text-codex-text-secondary">
+                  正在基于参考图生成提示词...
+                </p>
+              </div>
+            </div>
+          )}
+      </CollapsibleSection>
 
       {/* ── 生成结果 ── */}
       {result && (

@@ -12,7 +12,11 @@ import Select from '@/components/ui/Select';
 import Card from '@/components/ui/Card';
 import ProductSelect from '@/components/prompts/ProductSelect';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
+import CollapsibleSection from '@/components/ui/CollapsibleSection';
 import { getCustomValuesForRule, addCustomValue } from '@/lib/localStorage';
+
+/* 二期批次一：界面精简开关，改 true 恢复显示 */
+const SHOW_INFO_CARDS = false;
 
 interface PromptVersionCProps {
   ruleId: string;
@@ -75,6 +79,9 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
   const [templateError, setTemplateError] = useState('');
   /* 生成结果 */
   const [result, setResult] = useState<PromptResult | null>(null);
+  /* 配置区折叠状态：默认展开，生成成功后自动收起；点击标题栏可重新展开调整
+   * （交互与"中文结构化提示词"一致：点标题栏切换，箭头旋转） */
+  const [configExpanded, setConfigExpanded] = useState(true);
 
   /* 加载模板结构 */
   useEffect(() => {
@@ -180,6 +187,8 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
       });
       // 后端返回 {"success": true, "data": {...}}
       setResult(unwrapData(res));
+      /* 生成成功后配置区自动收起，聚焦到下方生图提示词 */
+      setConfigExpanded(false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : '生成失败';
       setError(msg);
@@ -216,6 +225,7 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
   return (
     <div className="space-y-3">
       {/* 🔒 锁定字段区域 */}
+      {SHOW_INFO_CARDS && (
       <Card className="bg-codex-bg border-l-4 border-l-orange-500">
         <h3 className="text-xs font-mono font-bold text-orange-400 mb-2">
           🔒 锁定字段（不可编辑）
@@ -229,12 +239,15 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
           ))}
         </div>
       </Card>
+      )}
 
-      {/* 可变维度下拉框区域 */}
-      <div className="space-y-2">
-        <h3 className="text-sm font-mono font-bold text-codex-text">
-          🔧 可变维度（选择变体）
-        </h3>
+      {/* 配置区：可变维度下拉框 + 目标产品 + 生成按钮。折叠交互与"中文结构化提示词"一致
+          （点标题栏展开/收起）；生成成功后自动收起，点击标题栏可重新展开调整并重新生成。 */}
+      <CollapsibleSection
+        title="🔧 可变维度（选择变体）"
+        expanded={configExpanded}
+        onExpandedChange={setConfigExpanded}
+      >
         {/* 窄栏适配：单列排列所有下拉框 */}
         <div className="grid grid-cols-1 gap-2">
           {template.selectable_fields.map((field) => (
@@ -294,47 +307,47 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
             </div>
           ))}
         </div>
-      </div>
 
-      {/* 目标产品 + 生成按钮 —— 窄栏内垂直排列 */}
-      <div className="flex flex-col gap-2 pt-2 border-t border-codex-border">
-        <div className="flex-1 w-full">
-          <ProductSelect
-            options={template.product_options || []}
-            value={targetProduct}
-            onChange={setTargetProduct}
-          />
-        </div>
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={handleGenerate}
-          loading={generating}
-          disabled={!targetProduct}
-          className="w-full"
-        >
-          📝 生成提示词
-        </Button>
-      </div>
-
-      {/* 错误提示 */}
-      {error && (
-        <div className="px-4 py-2 bg-red-900/20 border border-codex-danger rounded-md">
-          <p className="text-sm font-mono text-codex-danger">❌ {error}</p>
-        </div>
-      )}
-
-      {/* 生成中动画 */}
-      {generating && (
-        <div className="flex items-center justify-center py-12">
-          <div className="flex flex-col items-center gap-3">
-            <span className="inline-block w-8 h-8 border-3 border-codex-accent border-t-transparent rounded-full animate-spin" />
-            <p className="text-sm font-mono text-codex-text-secondary">
-              正在根据自定义模板生成提示词...
-            </p>
+        {/* 目标产品 + 生成按钮 —— 窄栏内垂直排列 */}
+        <div className="flex flex-col gap-2 pt-2 mt-2 border-t border-codex-border">
+          <div className="flex-1 w-full">
+            <ProductSelect
+              options={template.product_options || []}
+              value={targetProduct}
+              onChange={setTargetProduct}
+            />
           </div>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleGenerate}
+            loading={generating}
+            disabled={!targetProduct}
+            className="w-full"
+          >
+            📝 生成提示词
+          </Button>
         </div>
-      )}
+
+        {/* 错误提示 */}
+        {error && (
+          <div className="px-4 py-2 mt-2 bg-red-900/20 border border-codex-danger rounded-md">
+            <p className="text-sm font-mono text-codex-danger">❌ {error}</p>
+          </div>
+        )}
+
+        {/* 生成中动画 */}
+        {generating && (
+          <div className="flex items-center justify-center py-12">
+            <div className="flex flex-col items-center gap-3">
+              <span className="inline-block w-8 h-8 border-3 border-codex-accent border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm font-mono text-codex-text-secondary">
+                正在根据自定义模板生成提示词...
+              </p>
+            </div>
+          </div>
+        )}
+      </CollapsibleSection>
 
       {/* 生成结果展示 */}
       {result && (

@@ -10,6 +10,7 @@ import { useState, useMemo } from 'react';
 import Link from 'next/link';
 import Badge from '@/components/ui/Badge';
 import Select from '@/components/ui/Select';
+import Input from '@/components/ui/Input';
 import Card from '@/components/ui/Card';
 import { apiDelete } from '@/lib/api';
 
@@ -39,16 +40,46 @@ const filterOptions = [
   { label: 'C 级', value: 'C' },
 ];
 
+/* 二期批次一·需求3：排序选项 */
+type SortOption = 'date_desc' | 'date_asc' | 'name_asc';
+const sortOptions: Array<{ label: string; value: SortOption }> = [
+  { label: '创建时间 新→旧', value: 'date_desc' },
+  { label: '创建时间 旧→新', value: 'date_asc' },
+  { label: '名称 A→Z', value: 'name_asc' },
+];
+
 export default function RuleCardList({ rules, loading = false, onDeleted }: RuleCardListProps) {
   const [filter, setFilter] = useState('');
+  /* 二期批次一·需求3：搜索关键词（匹配规则名 + 核心卖点） */
+  const [searchQuery, setSearchQuery] = useState('');
+  /* 二期批次一·需求3：排序方式，默认与现状一致（创建时间新→旧） */
+  const [sortBy, setSortBy] = useState<SortOption>('date_desc');
   /* 正在删除中的规则 ID，用于禁用按钮防止重复点击 */
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  /* 根据筛选条件过滤 */
+  /* 根据筛选条件过滤 + 搜索 + 排序 */
   const filteredRules = useMemo(() => {
-    if (!filter) return rules;
-    return rules.filter((r) => r.reuse_level === filter);
-  }, [rules, filter]);
+    let result = filter ? rules.filter((r) => r.reuse_level === filter) : rules;
+
+    const q = searchQuery.trim().toLowerCase();
+    if (q) {
+      result = result.filter((r) =>
+        (r.rule_name + ' ' + (r.core_selling_point || '')).toLowerCase().includes(q)
+      );
+    }
+
+    /* 创建时间新→旧是后端返回的原始顺序，不需要额外排序；其余两种显式排序 */
+    if (sortBy === 'date_asc') {
+      result = [...result].reverse();
+    } else if (sortBy === 'name_asc') {
+      result = [...result].sort((a, b) => a.rule_name.localeCompare(b.rule_name, 'zh-CN'));
+    }
+
+    return result;
+  }, [rules, filter, searchQuery, sortBy]);
+
+  /* 是否有筛选/搜索条件生效（用于顶部显示"匹配 X 条」Badge） */
+  const hasActiveQuery = Boolean(filter || searchQuery.trim());
 
   /* 删除规则卡 */
   const handleDelete = async (e: React.MouseEvent, ruleId: string, ruleName: string) => {
@@ -105,13 +136,35 @@ export default function RuleCardList({ rules, loading = false, onDeleted }: Rule
           <Badge>
             {rules.length} 条
           </Badge>
+          {/* 二期批次一·需求3：有筛选/搜索条件时显示匹配计数 */}
+          {hasActiveQuery && (
+            <Badge variant="default">
+              匹配 {filteredRules.length} 条
+            </Badge>
+          )}
         </div>
-        <div className="w-36">
-          <Select
-            options={filterOptions}
-            value={filter}
-            onChange={setFilter}
-          />
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="w-52">
+            <Input
+              placeholder="搜索规则名/核心卖点..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+          </div>
+          <div className="w-40">
+            <Select
+              options={sortOptions}
+              value={sortBy}
+              onChange={(v) => setSortBy(v as SortOption)}
+            />
+          </div>
+          <div className="w-36">
+            <Select
+              options={filterOptions}
+              value={filter}
+              onChange={setFilter}
+            />
+          </div>
         </div>
       </div>
 
@@ -128,6 +181,14 @@ export default function RuleCardList({ rules, loading = false, onDeleted }: Rule
           >
             → 前往分析竞品图
           </Link>
+        </div>
+      ) : filteredRules.length === 0 && searchQuery.trim() ? (
+        /* 二期批次一·需求3：搜索无结果的专属空态文案 */
+        <div className="flex flex-col items-center justify-center py-20">
+          <span className="text-5xl mb-4">🔍</span>
+          <p className="text-codex-text-secondary font-mono text-center">
+            没有找到与「{searchQuery.trim()}」匹配的规则卡
+          </p>
         </div>
       ) : filteredRules.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20">
