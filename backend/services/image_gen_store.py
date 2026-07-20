@@ -7,11 +7,14 @@
 - 下载到本地的图片存储在 data/gen/images/
 """
 
+import base64
 import json
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Optional, List
+
+from services.file_utils import atomic_write_json
 
 import httpx
 
@@ -96,10 +99,9 @@ def save_task(task: ImageGenTask) -> None:
     """
     GEN_TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 保存 JSON 文件
+    # 保存 JSON 文件（原子写，防进程中断截断）
     json_path = GEN_TASKS_DIR / f"{task.task_id}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(task.model_dump(), f, ensure_ascii=False, indent=2)
+    atomic_write_json(json_path, task.model_dump())
 
     # 写入 SQLite 索引
     conn = _get_connection()
@@ -329,24 +331,42 @@ async def download_images(task_id: str) -> List[str]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         for idx, url in enumerate(task.image_urls):
             try:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    continue
-
-                # 根据 Content-Type 判断扩展名
-                content_type = resp.headers.get("content-type", "")
-                if "png" in content_type:
-                    ext = ".png"
-                elif "webp" in content_type:
-                    ext = ".webp"
+                if url.startswith("data:"):
+                    # data URI（OpenAI b64_json 模式）：httpx 不支持 data scheme，
+                    # 必然抛异常被下面的 except 吞掉、返回空列表。这里直接 base64
+                    # 解码落盘，绕开 httpx。格式：data:[<mediatype>][;base64],<data>
+                    header, b64data = url.split(",", 1)
+                    # 从 "data:image/png;base64" 提取 MIME "image/png"
+                    mime = header.split(":")[1].split(";")[0] if ":" in header else ""
+                    if "png" in mime:
+                        ext = ".png"
+                    elif "webp" in mime:
+                        ext = ".webp"
+                    elif "gif" in mime:
+                        ext = ".gif"
+                    else:
+                        ext = ".jpg"
+                    content = base64.b64decode(b64data)
                 else:
-                    ext = ".jpg"
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+
+                    # 根据 Content-Type 判断扩展名
+                    content_type = resp.headers.get("content-type", "")
+                    if "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+                    else:
+                        ext = ".jpg"
+                    content = resp.content
 
                 # 保存到本地
                 filename = f"{task_id}_{idx}{ext}"
                 filepath = GEN_IMAGES_DIR / filename
                 with open(filepath, "wb") as f:
-                    f.write(resp.content)
+                    f.write(content)
 
                 downloaded.append(str(filepath))
             except Exception:

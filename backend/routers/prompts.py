@@ -5,6 +5,7 @@
 - POST /api/prompts/generate-c       → 版本C：根据用户选择生成提示词
 """
 
+import logging
 from typing import List
 
 from fastapi import APIRouter, HTTPException
@@ -80,6 +81,7 @@ async def generate_version_a(request: GenerateARequest):
             target_product=request.target_product,
         )
     except Exception as e:
+        logging.exception("版本A提示词生成失败")  # 诊断：打印完整异常栈到日志
         raise HTTPException(
             status_code=500,
             detail=f"版本A提示词生成失败：{str(e)}",
@@ -114,6 +116,7 @@ async def generate_version_b(request: GenerateBRequest):
             target_product=request.target_product,
         )
     except Exception as e:
+        logging.exception("提示词生成失败（generate-b/generate-c）")  # 诊断：打印完整异常栈，靠请求路径区分 b/c
         raise HTTPException(
             status_code=500,
             detail=f"提示词生成失败：{str(e)}",
@@ -164,8 +167,9 @@ async def generate_version_c(request: GenerateCRequest):
             detail=f"规则卡 {request.rule_id} 不存在",
         )
 
-    # 生成提示词
-    generator = PromptGenerator()
+    # 生成提示词（R4：传 ai_client，让版本C 也能 AI 分析可定制项）
+    ai_client = load_ai_client_from_config()
+    generator = PromptGenerator(ai_client=ai_client)
     try:
         result = await generator.generate_from_selections(
             rule_card=rule.model_dump(),
@@ -173,6 +177,7 @@ async def generate_version_c(request: GenerateCRequest):
             target_product=request.target_product,
         )
     except Exception as e:
+        logging.exception("提示词生成失败（generate-b/generate-c）")  # 诊断：打印完整异常栈，靠请求路径区分 b/c
         raise HTTPException(
             status_code=500,
             detail=f"提示词生成失败：{str(e)}",

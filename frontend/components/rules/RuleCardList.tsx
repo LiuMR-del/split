@@ -142,6 +142,12 @@ export default function RuleCardList({ rules, loading = false, onDeleted }: Rule
           {filteredRules.map((rule) => (
             <Link key={rule.rule_id} href={`/rules/${rule.rule_id}`}>
               <Card hoverable className="h-full relative group">
+                {/* #12：缩略图（有则显示，旧规则卡无 thumbnail_path 则文字卡片兜底）*/}
+                {rule.thumbnail_path && (
+                  <div className="mb-2 rounded-md overflow-hidden border border-codex-border aspect-video bg-codex-bg">
+                    <img src={rule.thumbnail_path} alt={rule.rule_name} className="w-full h-full object-cover" />
+                  </div>
+                )}
                 {/* 顶部：名称 + Badge + 删除按钮 */}
                 <div className="flex items-start justify-between mb-2 gap-2">
                   <h3 className="text-sm font-mono font-bold text-codex-text leading-tight flex-1 min-w-0">

@@ -51,6 +51,7 @@ class ImageTagger:
             system_prompt=system_prompt,
             user_prompt=IMAGE_TAGGING_USER_PROMPT,
             media_type=media_type,
+            temperature=0,
         )
 
         # 解析 VLM 返回的 JSON（注意：打标场景解析失败时用 parse_error 单字段兜底，

@@ -24,6 +24,7 @@ from models.image_library import ImageTag
 from services.ai_client import load_ai_client_from_config
 from services.image_tagger import ImageTagger
 from services import image_library_store as store
+from services.image_format_utils import UPLOAD_ACCEPTED_MIME_TYPES  # #4：上传白名单唯一事实来源
 
 router = APIRouter(prefix="/library", tags=["图片库"])
 
@@ -120,7 +121,7 @@ async def upload_images(
         try:
             # 验证文件类型
             content_type = file.content_type or ""
-            if not content_type.startswith("image/"):
+            if content_type not in UPLOAD_ACCEPTED_MIME_TYPES:  # #4：用统一白名单（之前 startswith("image/") 会放行 SVG 等后续 AI 打标必炸的格式）
                 errors.append({
                     "filename": file.filename,
                     "error": f"不支持的文件类型: {content_type}",
@@ -131,7 +132,7 @@ async def upload_images(
             image_id = store.generate_image_id()
 
             # 保存原图
-            safe_filename = file.filename or "unknown.jpg"
+            safe_filename = Path(file.filename or "unknown.jpg").name  # #5：Path.name 防路径穿越（去掉 / 和 ..）
             image_filename = f"{image_id}_{safe_filename}"
             image_path = store.LIBRARY_IMAGES_DIR / image_filename
             store.LIBRARY_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,6 +189,14 @@ async def upload_images(
             })
 
         except Exception as e:
+            # #9：清理本次失败的占位文件（generate_image_id 已写占位占号，失败不清理会留垃圾+烧编号）
+            # image_id 可能未定义（若 generate_image_id 本身抛），用 try/except 吞掉清理异常
+            try:
+                placeholder = store.LIBRARY_JSON_DIR / f"{image_id}.json"
+                if placeholder.exists():
+                    placeholder.unlink()
+            except Exception:
+                pass
             errors.append({
                 "filename": file.filename or "unknown",
                 "error": str(e),
@@ -321,6 +330,8 @@ async def tag_image(image_id: str):
     existing.elements = ai_tags.get("elements", [])
     existing.layout_type = ai_tags.get("layout_type", "")
     existing.ai_tagged = True
+    # #16：重打标生成了全新 AI 标签，原"已人工审核"标记失真，重置为未审核（状态真实）
+    existing.manually_reviewed = False
 
     store.update_image(image_id, existing)
 

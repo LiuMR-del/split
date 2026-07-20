@@ -84,7 +84,7 @@ export default function RuleDetailPage() {
   /* 加载中 */
   if (loading) {
     return (
-      <div className="p-6 md:p-8 max-w-7xl mx-auto">
+      <div className="p-6 md:p-8 max-w-screen-2xl mx-auto">
         <div className="animate-pulse space-y-4">
           <div className="h-8 bg-codex-border/50 rounded w-1/3" />
           <div className="h-4 bg-codex-border/50 rounded w-2/3" />
@@ -97,7 +97,7 @@ export default function RuleDetailPage() {
   /* 规则不存在 */
   if (error || !ruleCard) {
     return (
-      <div className="p-6 md:p-8 max-w-7xl mx-auto">
+      <div className="p-6 md:p-8 max-w-screen-2xl mx-auto">
         <div className="flex flex-col items-center justify-center py-20">
           <span className="text-5xl mb-4">❌</span>
           <h2 className="text-xl font-mono font-bold text-codex-text mb-2">
@@ -123,7 +123,7 @@ export default function RuleDetailPage() {
   ];
 
   return (
-    <div className="p-6 md:p-8 max-w-7xl mx-auto">
+    <div className="p-6 md:p-8 max-w-screen-2xl mx-auto">
       {/* 页面标题 */}
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">

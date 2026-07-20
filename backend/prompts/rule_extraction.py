@@ -71,6 +71,7 @@ def get_rule_extraction_prompt() -> str:
 ### 第 0 层：核心卖点锚定（layer_0_core）
 分析买家为什么会为这个图案下单：
 - **core_selling_point**：买家下单的直接原因（一句话概括）
+- **core_selling_point_en**：核心卖点的英文版本（用英文描述，不要中文）
 - **selling_point_type**：从受控词表选择卖点类型
 - **why_it_sells**：为什么这个卖点能驱动购买（分析消费心理）
 - **lock_rule**：锁定规则——什么是绝对不能改的核心元素
@@ -86,9 +87,11 @@ def get_rule_extraction_prompt() -> str:
 ### 第 2 层：视觉结构层（layer_2_visual）
 分析图案的视觉构成：
 - **layout_formula**：构图公式（如"中心主体 + 环绕装饰 + 底部文字弧线"）
+- **layout_formula_en**：构图公式的英文版本（用英文描述，不要中文）
 - **must_have_elements**：必备元素列表，每个元素包含：
   - slot：槽位名称（如"主体角色"、"装饰元素"、"文字"）
   - description：元素描述
+  - description_en：元素描述的英文版本（用英文描述，不要中文）
   - position：位置（如"中心"、"顶部"、"底部弧形"）
   - visual_weight：视觉权重（"高/中/低"）
   - is_text_slot：是否为文字类槽位（true/false）。凡是名字、日期、祝福语、标语、
@@ -101,7 +104,9 @@ def get_rule_extraction_prompt() -> str:
 分析哪些元素可以替换、哪些不能动：
 - **replaceable_elements**：可替换元素字典，key 为元素名，value 包含：
   - original：原始值
+  - original_en：原始值的英文版本（用英文描述，不要中文）
   - alternatives：可替换的选项列表（给出 3-5 个建议）
+  - alternatives_en：可替换选项的英文版本列表（与 alternatives 一一对应，用英文描述，不要中文）
   - is_text_slot：是否为文字类槽位（true/false），判断标准同上
 - **must_not_change**：绝对不能替换的元素列表
 
@@ -134,6 +139,15 @@ def get_rule_extraction_prompt() -> str:
 - **reuse_level**：复用等级 S/A/B/C
 - **reuse_level_reason**：等级判断理由
 
+## 英文平行字段要求
+
+为支持英文生图提示词，以下字段需同时提供英文版本（字段名加 _en 后缀），用纯英文描述，不要包含任何中文：
+- layer_0_core.core_selling_point → core_selling_point_en
+- layer_2_visual.layout_formula → layout_formula_en
+- layer_2_visual.must_have_elements 每项的 description → description_en
+- layer_3_variable.replaceable_elements 每项的 original → original_en
+- layer_3_variable.replaceable_elements 每项的 alternatives → alternatives_en
+
 ## 输出格式要求
 
 请严格按以下 JSON 格式输出，不要添加任何 markdown 标记或额外文字：
@@ -142,6 +156,7 @@ def get_rule_extraction_prompt() -> str:
   "rule_name": "规则名称（简洁概括图案特征）",
   "layer_0_core": {{
     "core_selling_point": "...",
+    "core_selling_point_en": "[英文核心卖点一句话，纯英文描述买家下单的直接原因]",
     "selling_point_type": "...",
     "why_it_sells": "...",
     "lock_rule": "..."
@@ -155,8 +170,9 @@ def get_rule_extraction_prompt() -> str:
   }},
   "layer_2_visual": {{
     "layout_formula": "...",
+    "layout_formula_en": "[英文构图公式，纯英文描述画面布局结构]",
     "must_have_elements": [
-      {{"slot": "...", "description": "...", "position": "...", "visual_weight": "...", "is_text_slot": false}}
+      {{"slot": "...", "description": "...", "description_en": "[该元素的英文描述]", "position": "...", "visual_weight": "...", "is_text_slot": false}}
     ],
     "style": "...",
     "color_mood": "...",
@@ -164,7 +180,7 @@ def get_rule_extraction_prompt() -> str:
   }},
   "layer_3_variable": {{
     "replaceable_elements": {{
-      "元素名": {{"original": "...", "alternatives": ["...", "..."], "is_text_slot": false}}
+      "元素名": {{"original": "...", "original_en": "[该维度原值的英文描述]", "alternatives": ["...", "..."], "alternatives_en": ["[英文替代方案1]", "[英文替代方案2]"], "is_text_slot": false}}
     }},
     "must_not_change": ["..."]
   }},

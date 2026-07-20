@@ -10,11 +10,53 @@
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import List, Optional, Dict
 
+from services.file_utils import atomic_write_json
+
+import re as _re
+
 from models.image_library import ImageTag
 from services.vocab_utils import extract_chinese_part
+
+
+def _tokenize_for_jaccard(text: str) -> set:
+    """将文本拆为 token 集合，用于 Jaccard 相似度计算。
+
+    规则：中文按字拆分，英文按空格/标点拆分，全部小写，过滤长度<2 的纯中文 token。
+    """
+    if not text:
+        return set()
+    text = text.lower().strip()
+    tokens = set()
+    # 先按空格和常见标点切分
+    parts = _re.split(r'[\s,;/\-+&|()（）、，；。！？]+', text)
+    for part in parts:
+        if not part:
+            continue
+        # 如果包含中文字符，按字拆分
+        has_cjk = any('一' <= ch <= '鿿' for ch in part)
+        if has_cjk:
+            for ch in part:
+                if '一' <= ch <= '鿿':
+                    tokens.add(ch)
+                # 英文片段也保留
+            en_segments = _re.findall(r'[a-z]+', part)
+            for seg in en_segments:
+                if len(seg) >= 2:
+                    tokens.add(seg)
+        else:
+            # 纯英文/数字 token
+            if len(part) >= 2:
+                tokens.add(part)
+    return tokens
+
+
+def _escape_like(value: str) -> str:
+    """转义 SQLite LIKE 通配符 % 和 _，配合 ESCAPE '\\' 使用。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 # 数据目录
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -23,6 +65,14 @@ LIBRARY_JSON_DIR = LIBRARY_DIR
 LIBRARY_IMAGES_DIR = LIBRARY_DIR / "images"
 LIBRARY_THUMBNAILS_DIR = LIBRARY_DIR / "thumbnails"
 DB_PATH = DATA_DIR / "rules.db"  # 复用已有的 SQLite 数据库文件
+
+# 生成图片 ID 时用的进程内锁：
+# generate_image_id() 原本是"读当前最大编号 -> 算下一个"两步分离，跨请求并发
+# 上传时，两个请求可能在对方写入之前都执行了"读"，算出同一个 image_id，
+# 后写入的 save_image（INSERT OR REPLACE + JSON 文件覆盖）会把先写入的图片
+# 数据覆盖掉、原图文件变孤儿。用锁把"生成编号"和"用占位文件占住编号"合并成
+# 一步，杜绝这个竞态（与 image_gen_store.generate_task_id 同模式）。
+_image_id_lock = threading.Lock()
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -80,10 +130,9 @@ def save_image(tag: ImageTag) -> None:
     """
     LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 保存 JSON 文件
+    # 保存 JSON 文件（原子写，防进程中断截断）
     json_path = LIBRARY_JSON_DIR / f"{tag.image_id}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(tag.model_dump(), f, ensure_ascii=False, indent=2)
+    atomic_write_json(json_path, tag.model_dump())
 
     # 写入 SQLite 索引
     conn = _get_connection()
@@ -117,13 +166,23 @@ def save_image(tag: ImageTag) -> None:
 
 
 def get_image(image_id: str) -> Optional[ImageTag]:
-    """读取单张图片的标签数据"""
+    """读取单张图片的标签数据
+
+    如果该 image_id 目前还只是 generate_image_id() 创建的占位文件
+    （真正的标签数据还没被 save_image() 写入），返回 None，调用方应视
+    为"图片不存在/尚未就绪"，不要当成一个空标签处理
+    （与 image_gen_store.get_task 对占位文件的处理一致）。
+    """
     json_path = LIBRARY_JSON_DIR / f"{image_id}.json"
     if not json_path.exists():
         return None
 
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    if data.get("_placeholder"):
+        return None
+
     return ImageTag(**data)
 
 
@@ -158,20 +217,20 @@ def list_images(
     params = []
 
     if theme:
-        conditions.append("themes LIKE ?")
-        params.append(f"%{theme}%")
+        conditions.append("themes LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(theme)}%")
     if style:
-        conditions.append("styles LIKE ?")
-        params.append(f"%{style}%")
+        conditions.append("styles LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(style)}%")
     if color_mood:
-        conditions.append("color_moods LIKE ?")
-        params.append(f"%{color_mood}%")
+        conditions.append("color_moods LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(color_mood)}%")
     if emotion:
-        conditions.append("emotions LIKE ?")
-        params.append(f"%{emotion}%")
+        conditions.append("emotions LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(emotion)}%")
     if layout_type:
-        conditions.append("layout_type LIKE ?")
-        params.append(f"%{layout_type}%")
+        conditions.append("layout_type LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(layout_type)}%")
 
     where_clause = ""
     if conditions:
@@ -235,9 +294,8 @@ def update_image(image_id: str, tag: ImageTag) -> bool:
     if not json_path.exists():
         return False
 
-    # 更新 JSON 文件
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(tag.model_dump(), f, ensure_ascii=False, indent=2)
+    # 更新 JSON 文件（原子写，防进程中断截断）
+    atomic_write_json(json_path, tag.model_dump())
 
     # 更新 SQLite 索引
     conn = _get_connection()
@@ -335,38 +393,39 @@ def search_images(query: dict) -> List[ImageTag]:
     # 按各维度筛选（JSON 字符串中的模糊匹配）
     themes = query.get("themes", [])
     for t in themes:
-        conditions.append("themes LIKE ?")
-        params.append(f"%{t}%")
+        conditions.append("themes LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(t)}%")
 
     styles = query.get("styles", [])
     for s in styles:
-        conditions.append("styles LIKE ?")
-        params.append(f"%{s}%")
+        conditions.append("styles LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(s)}%")
 
     color_moods = query.get("color_moods", [])
     for c in color_moods:
-        conditions.append("color_moods LIKE ?")
-        params.append(f"%{c}%")
+        conditions.append("color_moods LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(c)}%")
 
     emotions = query.get("emotions", [])
     for e in emotions:
-        conditions.append("emotions LIKE ?")
-        params.append(f"%{e}%")
+        conditions.append("emotions LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(e)}%")
 
     target_audiences = query.get("target_audiences", [])
     for ta in target_audiences:
-        conditions.append("target_audiences LIKE ?")
-        params.append(f"%{ta}%")
+        conditions.append("target_audiences LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(ta)}%")
 
     keyword = query.get("keyword", "")
     if keyword:
-        conditions.append("(description LIKE ? OR elements LIKE ?)")
-        params.extend([f"%{keyword}%", f"%{keyword}%"])
+        escaped_kw = _escape_like(keyword)
+        conditions.append("(description LIKE ? ESCAPE '\\' OR elements LIKE ? ESCAPE '\\')")
+        params.extend([f"%{escaped_kw}%", f"%{escaped_kw}%"])
 
     layout_type = query.get("layout_type", "")
     if layout_type:
-        conditions.append("layout_type LIKE ?")
-        params.append(f"%{layout_type}%")
+        conditions.append("layout_type LIKE ? ESCAPE '\\'")
+        params.append(f"%{_escape_like(layout_type)}%")
 
     where_clause = ""
     if conditions:
@@ -543,40 +602,54 @@ def get_stats() -> dict:
 
 def generate_image_id() -> str:
     """
-    生成下一个图片 ID（IMG-0001 递增格式）。
-    查询 SQLite 获取当前最大编号。
+    生成下一个图片 ID（IMG-0001 递增格式），并立刻创建占位 JSON 文件占住这个编号。
+
+    "读取最大编号"和"占用编号"合并在同一把锁内完成：没有这把锁的话，两个几乎
+    同时到达的上传请求都可能在对方写入数据库/占位文件之前读到同一个"当前最大
+    编号"，从而算出同一个 image_id，后完成的一次会直接覆盖先完成的那次结果
+    （跨请求并发上传时复现）。
+
+    占位文件内容是 {"image_id": ..., "_placeholder": true}，调用方（upload_images）
+    随后会用 save_image() 写入真正的标签数据覆盖占位内容；get_image() 对占位文件
+    返回 None，避免调用方读到半成品数据。
     """
-    conn = _get_connection()
+    with _image_id_lock:
+        conn = _get_connection()
 
-    # 查询当前最大 image_id
-    row = conn.execute(
-        "SELECT image_id FROM image_library ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
+        # 查询当前最大 image_id（数据库里的）
+        row = conn.execute(
+            "SELECT image_id FROM image_library ORDER BY id DESC LIMIT 1"
+        ).fetchone()
 
-    if row:
-        # 从 IMG-0001 格式中提取数字
-        current_id = row["image_id"]
-        try:
-            num = int(current_id.split("-")[1])
-            return f"IMG-{num + 1:04d}"
-        except (IndexError, ValueError):
-            pass
+        max_num = 0
+        if row:
+            try:
+                max_num = int(row["image_id"].split("-")[1])
+            except (IndexError, ValueError):
+                pass
 
-    # 如果数据库为空或解析失败，也检查目录中的 JSON 文件
-    existing = list(LIBRARY_JSON_DIR.glob("IMG-*.json"))
-    if existing:
-        nums = []
-        for f in existing:
+        conn.close()
+
+        # 数据库为空或解析失败时，也检查目录中已有的 JSON 文件（含占位文件），
+        # 取较大值——占位文件占住的编号必须被计入，否则锁释放后下一个并发请求
+        # 的 glob 扫描看到的最大编号会少算，重新撞上同一个编号
+        LIBRARY_JSON_DIR.mkdir(parents=True, exist_ok=True)
+        for f in LIBRARY_JSON_DIR.glob("IMG-*.json"):
             try:
                 num = int(f.stem.split("-")[1])
-                nums.append(num)
+                max_num = max(max_num, num)
             except (IndexError, ValueError):
                 continue
-        if nums:
-            return f"IMG-{max(nums) + 1:04d}"
 
-    return "IMG-0001"
+        next_id = f"IMG-{max_num + 1:04d}"
+
+        # 立刻创建占位文件，占住这个编号 —— 锁释放后，下一个并发请求的 glob
+        # 扫描会看到这个文件，不会再算出同一个编号
+        placeholder_path = LIBRARY_JSON_DIR / f"{next_id}.json"
+        with open(placeholder_path, "w", encoding="utf-8") as f:
+            json.dump({"image_id": next_id, "_placeholder": True}, f)
+
+        return next_id
 
 
 # ==================== 内部辅助方法 ====================
@@ -687,19 +760,21 @@ def _weighted_similarity(rule_card: dict, image_data: dict) -> dict:
     else:
         scores['layout'] = 0.0
 
-    # 主题/元素匹配（Jaccard）
+    # 主题/元素匹配（Jaccard，token 级分词）
     rule_themes = set()
     for elem in rule_card.get('layer_2_visual', {}).get('must_have_elements', []):
         if isinstance(elem, dict):
             slot = elem.get('slot', '').lower()
             desc = elem.get('description', '').lower()
-            if slot:
-                rule_themes.add(slot)
-            if desc:
-                rule_themes.add(desc)
+            # 对 slot 和 desc 都做分词，避免整句与单词级标签比较时命中为零
+            rule_themes |= _tokenize_for_jaccard(slot)
+            rule_themes |= _tokenize_for_jaccard(desc)
     img_themes = set(t.lower() for t in image_data.get('themes', []))
     img_elements = set(e.lower() for e in image_data.get('elements', []))
-    img_all = img_themes | img_elements
+    # 图库侧也做分词，使粒度对齐
+    img_all = set()
+    for t in img_themes | img_elements:
+        img_all |= _tokenize_for_jaccard(t)
     if rule_themes and img_all:
         intersection = len(rule_themes & img_all)
         union = len(rule_themes | img_all)

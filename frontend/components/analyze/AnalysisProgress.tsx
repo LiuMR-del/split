@@ -15,7 +15,7 @@ interface AnalysisProgressProps {
 
 /* 步骤定义 */
 const steps = [
-  { key: 'uploading', icon: '📤', label: '上传图片' },
+  { key: 'uploading', icon: '📤', label: 'AI 分析中' },  /* #10：分析期间 stage='uploading'（apiUpload 阻塞 30-60s），label 诚实化 */
   { key: 'grading', icon: '📊', label: 'SABC 分级' },
   { key: 'extracting', icon: '🔍', label: '规则拆解' },
 ] as const;

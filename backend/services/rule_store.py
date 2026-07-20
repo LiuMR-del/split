@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import List, Optional
 
 from models.rule_card import RuleCard
+from services.file_utils import atomic_write_json
 
 # 数据目录
 DATA_DIR = Path(__file__).parent.parent / "data"
 RULES_DIR = DATA_DIR / "rules"
+UPLOADS_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "rules.db"
 
 
@@ -44,6 +46,27 @@ def init_db():
     conn.close()
 
 
+def generate_rule_id() -> str:
+    """生成递增的规则 ID（如 RULE-0001）：scan-max+1。
+
+    扫描 data/rules/ 已有 RULE-*.json 取最大编号 +1。不能用"文件数量+1"
+    （序列中间删除后数量永久比最大编号少1，会反复撞车）。
+
+    #25：供 rules.py create_rule 在保存时发现 rule_id 撞车（双标签页同时分析
+    未保存导致预生成同 ID）时重分配；分析阶段仍由 image_analyzer 预生成供预览。
+    """
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+    existing = list(RULES_DIR.glob("RULE-*.json"))
+    max_num = 0
+    for f in existing:
+        try:
+            num = int(f.stem.split("-")[1])
+            max_num = max(max_num, num)
+        except (IndexError, ValueError):
+            continue
+    return f"RULE-{max_num + 1:04d}"
+
+
 def save_rule(rule: RuleCard, thumbnail_path: str = "") -> None:
     """
     保存规则卡：
@@ -52,10 +75,9 @@ def save_rule(rule: RuleCard, thumbnail_path: str = "") -> None:
     """
     RULES_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 保存 JSON 文件
+    # 保存 JSON 文件（原子写，防进程中断截断）
     json_path = RULES_DIR / f"{rule.rule_id}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rule.model_dump(), f, ensure_ascii=False, indent=2)
+    atomic_write_json(json_path, rule.model_dump())
 
     # 写入 SQLite 索引
     conn = _get_connection()
@@ -125,9 +147,8 @@ def update_rule(rule_id: str, rule: RuleCard) -> bool:
     if not json_path.exists():
         return False
 
-    # 更新 JSON 文件
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rule.model_dump(), f, ensure_ascii=False, indent=2)
+    # 更新 JSON 文件（原子写，防进程中断截断）
+    atomic_write_json(json_path, rule.model_dump())
 
     # 更新 SQLite 索引
     conn = _get_connection()
@@ -147,8 +168,25 @@ def update_rule(rule_id: str, rule: RuleCard) -> bool:
 
 
 def delete_rule(rule_id: str) -> bool:
-    """删除规则卡，返回是否成功"""
+    """
+    删除规则卡及关联文件：
+    - JSON 规则文件
+    - SQLite 索引记录
+    - data/uploads/ 中的竞品原图和缩略图
+    """
     json_path = RULES_DIR / f"{rule_id}.json"
+
+    # 先读 JSON 取文件列表（删 JSON 后就读不到了）
+    source_images = []  # type: List[str]
+    thumbnail_path = ""
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            source_images = data.get("source_images", [])
+            thumbnail_path = data.get("thumbnail_path", "")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # 删除 JSON 文件
     if json_path.exists():
@@ -160,4 +198,19 @@ def delete_rule(rule_id: str) -> bool:
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
+
+    # 清理 uploads 目录中的竞品原图
+    for filename in source_images:
+        if not filename:
+            continue
+        image_file = UPLOADS_DIR / filename
+        image_file.unlink(missing_ok=True)
+
+    # 清理缩略图（thumbnail_path 格式为 "/uploads/xxx.jpg"）
+    if thumbnail_path:
+        thumb_name = Path(thumbnail_path).name
+        if thumb_name:
+            thumb_file = UPLOADS_DIR / thumb_name
+            thumb_file.unlink(missing_ok=True)
+
     return deleted

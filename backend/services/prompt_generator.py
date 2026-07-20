@@ -8,15 +8,25 @@
 """
 
 import json
+import logging
 from typing import List, Optional
 
-from prompts.prompt_generation import get_recommendation_prompt
+from prompts.prompt_generation import get_recommendation_prompt, get_customization_analysis_prompt
 from services.ai_response_utils import extract_json_from_ai_response
 from services.vocab_utils import extract_english_part
 
 
 # 通用负向提示词（生图时需要排除的内容）
 # 注意：不排除 text/letters/words，因为 POD 产品需要 AI 画上示例文字
+# 排除中文文字，确保生成的图不出现中文。提示词本身可含中文，仅约束生成图。
+# 该常量被版本A/B/C共用（_build_image_prompts 和 generate_version_a 都引用它）。
+# 用词精确指向"中文文字"（chinese characters/text、hanzi），不用泛 "chinese"
+# 以免误伤中式风格/亚洲元素；不用 cjk characters（会连带排除日韩文字，超出需求）；
+# 不用 chinese fonts（"fonts"易被理解为字体风格，可能压制书法/水墨等合法风格）。
+# 注意：OpenAI 同步模式下 negative_prompt 会被合并进正向（Do not include: ...），
+# 对指令遵循弱的模型可能有"粉红大象"效应，因此"图无中文"主要靠正向的
+# "english text only" 引导（见 _build_image_prompts / generate_version_a 质量词），
+# 这里的负向词作为补充（对支持独立 negative_prompt 字段的模型生效）。
 COMMON_NEGATIVE_PROMPTS = [
     "watermark",
     "signature",
@@ -33,6 +43,18 @@ COMMON_NEGATIVE_PROMPTS = [
     "out of frame",
     "extra limbs",
     "bad anatomy",
+    "chinese characters",
+    "chinese text",
+    "hanzi",
+]
+
+# POD 印刷质量补充排除项（COMMON_NEGATIVE_PROMPTS 之外的 POD 专属负向词，
+# 版本A 的 generate_version_a 和 版本B/C 的 _build_image_prompts 共用，避免重复定义）
+# #15：去掉 watermark/signature——它们已在 COMMON_NEGATIVE_PROMPTS 里，拼接处虽有
+# 去重兜底，源头去掉更干净，也避免维护两处。
+POD_NEGATIVE_ADDITIONS = [
+    "low resolution",
+    "blurry edges", "unprintable artifacts",
 ]
 
 
@@ -87,6 +109,12 @@ class PromptGenerator:
         recommended_changes = recommended.get("recommended_changes", {})
         reason = recommended.get("reason", "随机选取替代方案")
 
+        # R4：提取可定制项。传 None（字段缺失，如随机模式/AI降级）走规则卡兜底；
+        # AI 显式返回 [] 表示"无可定制项"则尊重，不兜底。故不设默认 []，缺失传 None。
+        customization_slots = self._extract_customization_slots(
+            rule_card, recommended.get("customization_slots")
+        )
+
         # 获取产品适配规则
         adaptation = self._get_adaptation(layer_4, target_product)
 
@@ -105,14 +133,32 @@ class PromptGenerator:
         # 生成改款说明
         change_summary = self._build_change_summary(layer_3, recommended_changes, locked_core)
 
+        # #2：出口加工 recommended_changes_detail，供前端版本B卡片显示"维度:原值->新值"。
+        # original 只从 layer_3 取（单一事实来源，不让 AI 重述避免不一致），参考 _build_change_summary 同款逻辑。
+        # key 恒等于 layer_3 维度名（_random_recommend 遍历 layer_3，AI prompt 约束"只从第3层选"）；
+        # 取不到时 original 留空字符串，前端有 change.original && 守卫兜底。
+        replaceable = layer_3.get("replaceable_elements", {})
+        recommended_changes_detail = []
+        for dim, val in recommended_changes.items():
+            item = replaceable.get(dim, {})
+            original = item.get("original", "") if isinstance(item, dict) else ""
+            recommended_changes_detail.append({
+                "dimension": dim,
+                "original": original,
+                "changed_to": val,
+            })
+
         return {
             "locked_core": locked_core,
             "recommended_changes": recommended_changes,
+            "recommended_changes_detail": recommended_changes_detail,
             "reason": reason,
             "structured_prompt_cn": structured_prompt_cn,
             "image_prompt_positive": image_prompt_positive,
             "image_prompt_negative": image_prompt_negative,
             "change_summary": change_summary,
+            # R4：可定制项列表，前端展示为可选 checkbox，勾选后其 prompt_fragment 拼入生图提示词
+            "customization_slots": customization_slots,
         }
 
     # ==================== 版本 A：资料库关联版 ====================
@@ -156,22 +202,31 @@ class PromptGenerator:
         ref_elements = []       # type: List[str]
 
         for img in reference_images:
+            # #1：图库 styles/color_moods/layout_type 经 _extract_english，含 CJK 的丢弃（图库打标是中文）
             for s in (img.get('styles') or []):
                 eng = self._extract_english(s)
-                if eng and eng not in ref_visual_style:
+                if eng and not self._contains_cjk(eng) and eng not in ref_visual_style:
                     ref_visual_style.append(eng)
+                elif eng and self._contains_cjk(eng):
+                    logging.warning("#1: 版本A ref style 含中文，丢弃: %s", eng[:50])
             for c in (img.get('color_moods') or []):
                 eng = self._extract_english(c)
-                if eng and eng not in ref_color_palette:
+                if eng and not self._contains_cjk(eng) and eng not in ref_color_palette:
                     ref_color_palette.append(eng)
+                elif eng and self._contains_cjk(eng):
+                    logging.warning("#1: 版本A ref color 含中文，丢弃: %s", eng[:50])
             layout = img.get('layout_type', '')
             if layout:
                 eng = self._extract_english(layout)
-                if eng and eng not in ref_composition:
+                if eng and not self._contains_cjk(eng) and eng not in ref_composition:
                     ref_composition.append(eng)
+                elif eng and self._contains_cjk(eng):
+                    logging.warning("#1: 版本A ref layout 含中文，丢弃: %s", eng[:50])
             for e in (img.get('elements') or []):
-                if e and e not in ref_elements:
+                if e and not self._contains_cjk(e) and e not in ref_elements:
                     ref_elements.append(e)
+                elif e and self._contains_cjk(e):
+                    logging.warning("#1: 版本A ref element 含中文，丢弃: %s", e[:50])
 
         # 3. 获取产品适配规则
         adaptation = self._get_adaptation(layer4, target_product)
@@ -179,26 +234,28 @@ class PromptGenerator:
         # 4. 构建英文正向提示词——结构化融合参考图特征
         prompt_parts = []  # type: List[str]
 
-        # 核心构图（从规则卡）
+        # 核心构图（从规则卡）。#1b：优先 layout_formula_en（VLM 英文输出），缺失回退中文。
+        # layout 是关键构图信息，无 _en 时保留中文+warning（不丢信息），根因后 _en 覆盖。
         layout_formula = layer2.get("layout_formula", "")
-        if layout_formula:
-            prompt_parts.append(layout_formula)
+        layout_en = layer2.get("layout_formula_en") or layout_formula
+        self._append_english(prompt_parts, layout_en, "layout_formula", allow_cjk_fallback=True)
 
-        # 参考图风格融合
+        # 参考图风格融合（ref_visual_style 元素已 CJK 过滤，fallback 用 _append_english 兜底）
         if ref_visual_style:
             prompt_parts.append("{} style".format(', '.join(ref_visual_style)))
         else:
             fallback_style = self._extract_english(layer2.get("style", ""))
-            if fallback_style:
-                prompt_parts.append(fallback_style)
+            self._append_english(prompt_parts, fallback_style, "fallback_style")
 
         # 参考图色彩融合
         if ref_color_palette:
             prompt_parts.append("{} color palette".format(', '.join(ref_color_palette)))
         else:
             fallback_color = self._extract_english(layer2.get("color_mood", ""))
-            if fallback_color:
+            if fallback_color and not self._contains_cjk(fallback_color):
                 prompt_parts.append(fallback_color)
+            elif fallback_color:
+                logging.warning("#1: fallback color_mood 含中文，丢弃: %s", fallback_color[:50])
 
         # 参考图构图融合
         if ref_composition:
@@ -216,25 +273,24 @@ class PromptGenerator:
         if ratio:
             prompt_parts.append("aspect ratio {}".format(ratio))
         if adapt_notes:
-            prompt_parts.append(adapt_notes)
+            # #1：adaptation_notes 可能是中文（如"通用适配"），关键适配信息保留+warning（不丢）
+            self._append_english(prompt_parts, adapt_notes, "adaptation_notes", allow_cjk_fallback=True)
 
         # POD 定制要素
         pod_hints = self._get_pod_hints(rule_card)
         prompt_parts.extend(pod_hints)
 
         # 通用质量
-        prompt_parts.extend(["high quality", "detailed", "professional design"])
+        # R1：正向引导"只画英文文字"——比负向排除更可靠。OpenAI 模式下负向会被
+        # 合并进正向（Do not include: ...），对弱模型有"粉红大象"效应，正向引导是主保障。
+        prompt_parts.extend(["high quality", "detailed", "professional design", "english text only"])
 
         positive = ", ".join([p for p in prompt_parts if p])
 
         # 5. 构建负向提示词
         negative_parts = list(COMMON_NEGATIVE_PROMPTS)
         # POD 印刷质量排除项
-        pod_negative = [
-            "watermark", "signature", "low resolution",
-            "blurry edges", "unprintable artifacts",
-        ]
-        for neg in pod_negative:
+        for neg in POD_NEGATIVE_ADDITIONS:
             if neg not in negative_parts:
                 negative_parts.append(neg)
         negative = ", ".join(negative_parts)
@@ -297,6 +353,8 @@ class PromptGenerator:
         # 过滤空字符串
         change_summary["changed"] = [c for c in change_summary["changed"] if c]
 
+        # R4：可定制项--有 AI 走 AI 分析判断，无 AI 走规则卡兜底
+        customization_slots = await self._get_customization_slots_with_ai_fallback(rule_card)
         return {
             "locked_core": locked_core,
             "structured_prompt_cn": structured_cn,
@@ -306,6 +364,8 @@ class PromptGenerator:
             "reference_images_used": [
                 img.get('image_id', '') for img in reference_images
             ],
+            # R4：可定制项列表，前端展示为可选 checkbox，勾选后拼入生图提示词
+            "customization_slots": customization_slots,
         }
 
     # ==================== 版本 C：自定义模板版 ====================
@@ -418,6 +478,8 @@ class PromptGenerator:
         # 生成改款说明
         change_summary = self._build_change_summary(layer_3, recommended_changes, locked_core)
 
+        # R4：可定制项--有 AI 走 AI 分析判断，无 AI 走规则卡兜底
+        customization_slots = await self._get_customization_slots_with_ai_fallback(rule_card)
         return {
             "locked_core": locked_core,
             "recommended_changes": recommended_changes,
@@ -426,6 +488,8 @@ class PromptGenerator:
             "image_prompt_positive": image_prompt_positive,
             "image_prompt_negative": image_prompt_negative,
             "change_summary": change_summary,
+            # R4：可定制项列表，前端展示为可选 checkbox，勾选后拼入生图提示词
+            "customization_slots": customization_slots,
         }
 
     # ==================== 内部辅助方法 ====================
@@ -464,7 +528,8 @@ class PromptGenerator:
                 if isinstance(item, dict) and item.get("is_text_slot"):
                     original = item.get("original", "")
                     if original and len(original) < 100:  # 排除过长的描述
-                        extracted_texts[dim_name] = original
+                        # R1：确保示例文案为英文，避免正向写中文与负向排除中文矛盾
+                        extracted_texts[dim_name] = self._sanitize_text_slot_value(dim_name, original)
 
             # 从 must_have_elements 里标记了 is_text_slot=True 的项取描述
             for elem in must_have:
@@ -474,16 +539,20 @@ class PromptGenerator:
                 desc = elem.get("description", "")
                 if slot in extracted_texts:
                     continue
-                # 如果 desc 是具体英文文案（包含英文字母且不太长），直接用
-                has_english = any(c.isalpha() and ord(c) < 128 for c in desc)
-                if has_english and len(desc) < 80:
-                    extracted_texts[slot] = desc
+                # 语义去重：同一个文字元素往往在 layer_3（replaceable，如 犬种名称='Dachshund'）
+                # 和 layer_2（must_have，如 主题文字区='大号手写体主题文字，当前为"Dachshund"'）各记一次，
+                # 槽位名不同所以上面的 slot 去重挡不住。desc 里若包含任何已提取的文案值，
+                # 判定为同一元素跳过——否则同一文字在提示词里出现两次，生图会画出两份（图中出现两个 name 的根因之一）
+                if any(val and val in desc for val in extracted_texts.values()):
+                    continue
+                # R1：用 _sanitize 确保示例文案为英文（含中文等非 ASCII 转占位符），
+                # 避免正向写中文与负向排除中文矛盾
+                if desc and len(desc) < 80:
+                    extracted_texts[slot] = self._sanitize_text_slot_value(slot, desc)
                 elif "名字" in slot.lower() or "name" in slot.lower():
                     extracted_texts[slot] = "NAME"
                 elif "日期" in slot.lower() or "date" in slot.lower():
                     extracted_texts[slot] = "2026"
-                elif desc:
-                    extracted_texts[slot] = desc[:50] if len(desc) < 50 else "NAME"
         else:
             # ── 兜底路径：关键词字符串匹配（兼容没有 is_text_slot 字段的旧规则卡）──
             text_keywords = ['标题', '文案', '名字', '名称', '短句', '日期',
@@ -494,7 +563,8 @@ class PromptGenerator:
                 if any(kw in dim_name.lower() for kw in text_keywords):
                     original = item.get("original", "") if isinstance(item, dict) else str(item)
                     if original and len(original) < 100:  # 排除过长的描述
-                        extracted_texts[dim_name] = original
+                        # R1：确保示例文案为英文，避免正向写中文与负向排除中文矛盾
+                        extracted_texts[dim_name] = self._sanitize_text_slot_value(dim_name, original)
 
             # 从 must_have_elements 中补充（如果 replaceable 没覆盖到的文字槽位）
             for elem in must_have:
@@ -506,10 +576,12 @@ class PromptGenerator:
                 if any(kw in slot_lower for kw in text_keywords):
                     # 检查 desc 是否像具体文案（而非"两个人名字"这种描述）
                     if slot not in extracted_texts:
-                        # 如果 desc 是具体英文文案（包含英文字母且不太长），直接用
-                        has_english = any(c.isalpha() and ord(c) < 128 for c in desc)
-                        if has_english and len(desc) < 80:
-                            extracted_texts[slot] = desc
+                        # 语义去重：desc 包含已提取的文案值 = 两层记的同一个文字元素，跳过防重复（同优先路径）
+                        if any(val and val in desc for val in extracted_texts.values()):
+                            continue
+                        # R1：用 _sanitize 确保示例文案为英文（含中文等非 ASCII 转占位符）
+                        if desc and len(desc) < 80:
+                            extracted_texts[slot] = self._sanitize_text_slot_value(slot, desc)
                         elif "名字" in slot_lower or "name" in slot_lower:
                             extracted_texts[slot] = "NAME"
                         elif "日期" in slot_lower or "date" in slot_lower:
@@ -520,11 +592,18 @@ class PromptGenerator:
 
         if extracted_texts:
             # 有具体文字，用识别到的真实文案作示例
+            # 按"值"去重（保序）：不同槽位的中文描述会被 _sanitize 统一转成 'NAME'，
+            # 不去重就输出 'NAME', 'NAME'——提示词字面要求画两个 NAME，图上必然重复
             text_parts = []
+            seen_values = set()
             for slot, text in extracted_texts.items():
+                if text in seen_values:
+                    continue
+                seen_values.add(text)
                 text_parts.append(f"'{text}'")
             hints.append(
                 f"include personalized text elements in the design: {', '.join(text_parts)}, "
+                "each text appears exactly once, "
                 "positioned naturally as part of the layout for print-on-demand customization"
             )
         else:
@@ -535,13 +614,52 @@ class PromptGenerator:
             )
 
         # 通用 POD 质量要求
+        # #15：删掉 "no watermark no signature"--负向列表已含 watermark/signature，
+        # 正向写否定句对指令遵循弱的模型有"粉红大象"效应（反被诱导画出水印）。
         hints.extend([
             "clean printable design",
             "high resolution suitable for fabric/product printing",
-            "no watermark no signature",
         ])
 
         return hints
+
+    async def _call_ai_for_json(self, system_prompt: str, user_prompt: str, temperature: Optional[float] = None) -> Optional[dict]:
+        """封装"调 AI 文本请求 + 解析 JSON"，失败返回 None。
+
+        供 _ai_recommend（版本B 改款推荐）和 _ai_analyze_customization_slots（A/C 可定制项分析）共用，
+        消除"序列化 rule_card + 调 AI + 解析 JSON + 异常处理"的重复骨架。降级策略由调用方控制。
+
+        参数:
+            temperature: 可选，结构化任务传 0（稳定输出），创意任务不传（保持多样性）
+        """
+        try:
+            response = await self.ai_client.text_request(system_prompt, user_prompt, temperature=temperature)
+            return extract_json_from_ai_response(response)
+        except Exception:
+            return None
+
+    async def _get_customization_slots_with_ai_fallback(self, rule_card: dict) -> list:
+        """R4：可定制项--有 AI 走 AI 分析判断（不全加），无 AI 走规则卡兜底。"""
+        if self.ai_client:
+            return await self._ai_analyze_customization_slots(rule_card)
+        return self._extract_customization_slots(rule_card, None)
+
+    async def _ai_analyze_customization_slots(self, rule_card: dict) -> list:
+        """R4：AI 分析规则卡，判断适配这张图的可定制项（不全加，AI 判断哪些适配+位置）。
+
+        供版本A/C 用（它们不做改款推荐，但需要 AI 判断可定制项）。AI 基于规则卡
+        （VLM 分析图得出的结构化数据）判断哪些定制项适配、位置在哪。失败时兜底
+        从规则卡 is_text_slot 项提取。
+        """
+        rule_card_json = json.dumps(rule_card, ensure_ascii=False, indent=2)
+        system_prompt = get_customization_analysis_prompt(rule_card_json)
+        user_prompt = "请基于规则卡判断这张图适合哪些可定制项，严格按 JSON 格式输出。"
+        result = await self._call_ai_for_json(system_prompt, user_prompt, temperature=0)
+        if result is None:
+            return self._extract_customization_slots(rule_card, None)  # AI 调用失败兜底
+        ai_slots = result.get("customization_slots", []) if isinstance(result, dict) else []
+        # 用 _extract_customization_slots 校验（传 AI 返回的 slots，主路径校验+补 fragment）
+        return self._extract_customization_slots(rule_card, ai_slots)
 
     async def _ai_recommend(self, rule_card: dict, target_product: str) -> dict:
         """调用 AI 推荐改款方向
@@ -558,26 +676,17 @@ class PromptGenerator:
         system_prompt = get_recommendation_prompt(rule_card_json, target_product)
         user_prompt = f"请基于规则卡为「{target_product}」推荐一个改款方向，严格按 JSON 格式输出。"
 
-        try:
-            # 调用 AI（纯文本请求，不需要图片）
-            response = await self.ai_client.text_request(system_prompt, user_prompt)
-            result = extract_json_from_ai_response(response)
-
-            # 校验返回结构
-            if "recommended_changes" in result:
-                return result
-            else:
-                # AI 返回格式异常，降级为随机推荐
-                layer_3 = rule_card.get("layer_3_variable", {})
-                fallback = self._random_recommend(layer_3, target_product)
-                fallback["reason"] = f"AI 返回格式异常，已降级为随机推荐。原始响应：{response[:200]}"
-                return fallback
-        except Exception as e:
-            # AI 调用失败，降级为随机推荐
-            layer_3 = rule_card.get("layer_3_variable", {})
-            fallback = self._random_recommend(layer_3, target_product)
-            fallback["reason"] = f"AI 调用失败（{str(e)}），已降级为随机推荐"
-            return fallback
+        result = await self._call_ai_for_json(system_prompt, user_prompt)
+        if result and "recommended_changes" in result:
+            return result
+        # AI 调用失败（result is None）或返回格式异常，降级为随机推荐
+        layer_3 = rule_card.get("layer_3_variable", {})
+        fallback = self._random_recommend(layer_3, target_product)
+        fallback["reason"] = (
+            "AI 调用失败或返回格式异常，已降级为随机推荐" if result is None
+            else "AI 返回格式异常，已降级为随机推荐"
+        )
+        return fallback
 
     def _random_recommend(self, layer_3: dict, target_product: str) -> dict:
         """随机推荐模式：从 alternatives 中取第一个替代方案
@@ -609,6 +718,153 @@ class PromptGenerator:
             "layout_description": "",
             "negative_elements": [],
         }
+
+    def _parse_is_text_slot(self, raw) -> bool:
+        """R4：解析 is_text_slot 字段为布尔值。
+
+        LLM 常返回字符串 "true"/"false" 而非布尔，bool("false")==True 会误判，
+        故字符串时按内容判断（strip+lower=="true"）；非字符串走 bool()。
+        主路径（AI 返回）和兜底路径（规则卡）共用，保证一致。
+        """
+        if isinstance(raw, str):
+            return raw.strip().lower() == "true"
+        return bool(raw)
+
+    def _extract_customization_slots(self, rule_card: dict, ai_slots: list) -> list:
+        """R4：提取可定制项列表，供前端展示为可选 checkbox。
+
+        优先用 AI 返回的 ai_slots（校验+补全 prompt_fragment）；
+        AI 未返回或格式异常时，从规则卡兜底——layer_2.must_have_elements 和
+        layer_3.replaceable_elements 里 is_text_slot=True 的项都是可定制文字位。
+        兜底逻辑与 _get_pod_hints 同源数据、同思路。返回的每项都含
+        slot_name/position/description/is_text_slot/prompt_fragment（fragment 全英文，
+        呼应 R1 图无中文）。
+        """
+        slots = []
+        # 主路径：AI 返回了 customization_slots（含空数组 []——尊重 AI"无可定制项"的判断，不兜底）
+        if isinstance(ai_slots, list):
+            for s in ai_slots:
+                if not isinstance(s, dict) or not s.get("slot_name"):
+                    continue
+                slot = {
+                    "slot_name": str(s.get("slot_name", "")),
+                    "position": str(s.get("position", "")),
+                    "description": str(s.get("description", "")),
+                    # R4：用 _parse_is_text_slot 解析（字符串 true/false 防误判）
+                    "is_text_slot": self._parse_is_text_slot(s.get("is_text_slot", False)),
+                }
+                # prompt_fragment 缺失或含中文则兜底生成（确保英文，呼应 R1）
+                frag = s.get("prompt_fragment", "")
+                if frag and not self._contains_cjk(frag):
+                    slot["prompt_fragment"] = str(frag)
+                else:
+                    slot["prompt_fragment"] = self._build_slot_prompt_fragment(slot)
+                slots.append(slot)
+            return slots[:5]  # AI 显式返回（含空 [] 或格式无效）尊重，不兜底；限制最多 5 项
+
+        # 兜底路径：ai_slots 非 list（缺失/None，如随机模式/A/C 版本），从规则卡提取。
+        # 从 layer_2.must_have_elements 提取 is_text_slot 项（带 position 实际位置，与图设计适搭），
+        # description 优先用 layer_3 同组 original（真实文案）。
+        # 按优先级排序（名字/年龄/团队/家族优先），限制最多 5 项，避免过多定制项。
+        layer2 = rule_card.get("layer_2_visual", {})
+        layer3 = rule_card.get("layer_3_variable", {})
+        must_have = layer2.get("must_have_elements", [])
+        replaceable = layer3.get("replaceable_elements", {})
+
+        # 优先关键词组（名字/年龄/团队/家族），用于排序 + layer2<->layer3 匹配
+        priority_groups = [
+            ['名字', '姓名', '名称', 'name'],
+            ['年龄', 'age', '生日', 'birthday', '日期', 'date', 'year', '年份'],
+            ['团队', 'team', '队伍', '球队'],
+            ['家族', 'family', '家庭', '姓氏', 'surname'],
+        ]
+
+        def match_group(name):
+            nl = (name or "").lower()
+            for i, kws in enumerate(priority_groups):
+                if any(kw in nl for kw in kws):
+                    return i
+            return len(priority_groups)  # 非优先，排后
+
+        # layer3 的 is_text_slot 项按组索引（取 original 真实文案）
+        layer3_original_by_group = {}
+        for dim_name, item in replaceable.items():
+            if isinstance(item, dict) and self._parse_is_text_slot(item.get("is_text_slot", False)):
+                g = match_group(dim_name)
+                if g not in layer3_original_by_group:
+                    layer3_original_by_group[g] = item.get("original", "")
+
+        raw_slots = []
+        for elem in must_have:
+            if not (isinstance(elem, dict) and self._parse_is_text_slot(elem.get("is_text_slot", False))):
+                continue
+            slot_name = elem.get("slot", "")
+            g = match_group(slot_name)
+            # description 优先用 layer3 同组 original（真实文案），否则 layer2.description
+            desc = layer3_original_by_group.get(g) or elem.get("description", "")
+            raw_slots.append({
+                "slot_name": slot_name,
+                "position": elem.get("position", ""),  # layer2 实际位置（与图设计适搭）
+                "description": desc,
+                "is_text_slot": True,
+                "_group": g,
+            })
+        # 按优先级排序（名字/年龄/团队/家族在前），限制最多 5 项
+        raw_slots.sort(key=lambda s: s["_group"])
+        for s in raw_slots[:5]:
+            del s["_group"]
+            s["prompt_fragment"] = self._build_slot_prompt_fragment(s)
+            slots.append(s)
+        return slots
+
+    def _translate_position_cn(self, position: str) -> str:
+        """把中文位置描述映射成英文（如"顶部居中"->"top center"），用于 fragment。
+
+        让定制项位置与图中的设计适搭（layer_2.must_have 的 position 是 VLM 分析图得出的
+        实际位置），而非通用 "in the design"。覆盖常见位置词。
+        """
+        parts = []
+        if any(w in position for w in ["顶", "上"]):
+            parts.append("top")
+        if any(w in position for w in ["底", "下"]):
+            parts.append("bottom")
+        if any(w in position for w in ["居中", "中央", "中心"]):
+            parts.append("center")
+        if "左" in position:
+            parts.append("left")
+        if "右" in position:
+            parts.append("right")
+        if "胸" in position:
+            parts.append("chest")
+        return " ".join(parts)
+
+    def _build_slot_prompt_fragment(self, slot: dict) -> str:
+        """R4：为缺失 prompt_fragment 的可定制项兜底生成英文片段（拼入正向生图提示词）。
+
+        文字定制位带具体文案（经 _sanitize 去中文，呼应 R1），让每个槽位 fragment 不同、
+        对生图有实际引导；文案为中文或缺失时回退通用表述。图案元素位用元素描述。
+        position/description 可能中文，取英文部分；含中文或无英文用通用表述，确保全英文。
+        """
+        is_text = slot.get("is_text_slot", False)
+        position = slot.get("position", "")
+        position_en = self._extract_english(position)
+        if not position_en or self._contains_cjk(position_en):
+            # 中文 position 映射成英文（与图设计适搭，如"顶部居中"->"top center"）
+            position_en = self._translate_position_cn(position) or "in the design"
+        if is_text:
+            # 文字槽位：带具体文案（经 _sanitize 去中文），让每个槽位 fragment 不同
+            original = slot.get("description", "") or slot.get("slot_name", "")
+            if original:
+                sanitized = self._sanitize_text_slot_value(slot.get("slot_name", ""), original)
+                # sanitized 为英文文案时带上；为占位符 NAME/2026（中文文案转的）时用通用表述
+                if sanitized and not self._contains_cjk(sanitized) and sanitized not in ("NAME", "2026"):
+                    return f"customizable text '{sanitized}' {position_en}".strip()
+            return f"customizable text placeholder {position_en}".strip()
+        desc = slot.get("description", "")
+        desc_en = self._extract_english(desc)
+        if not desc_en or self._contains_cjk(desc_en):
+            desc_en = "element"
+        return f"customizable {desc_en} {position_en}".strip()
 
     def _get_adaptation(self, layer_4: dict, target_product: str) -> dict:
         """获取产品适配规则
@@ -696,7 +952,7 @@ class PromptGenerator:
         replaceable = layer_3.get("replaceable_elements", {})
         for field_name, item in replaceable.items():
             original = item.get("original", "")
-            chosen = changes.get(field_name, original)
+            chosen = changes.get(field_name) or original  # #14：不传 default，空串/None 回退原值（避免空自定义值被误判为"已替换"丢元素/进负向）
             if chosen != original:
                 lines.append(f"  {field_name}：{original} → {chosen}（已替换）")
             else:
@@ -778,41 +1034,61 @@ class PromptGenerator:
         ai_color = recommended.get("color_description", "")
         ai_layout = recommended.get("layout_description", "")
 
-        # 提取英文部分（词表格式为 "中文/English"）
+        # 提取英文部分（词表格式为 "中文/English"）。#1b：layout 优先取 _en 平行字段（VLM 英文输出），
+        # style/color_mood 是词表格式 _extract_english 可取英文，无需 _en。
         style_en = ai_style if ai_style else self._extract_english(style)
         color_en = ai_color if ai_color else self._extract_english(color_mood)
-        layout_en = ai_layout if ai_layout else layout
+        layout_en = layer_2.get("layout_formula_en") or ai_layout or layout
 
-        # 2. 构图和风格
-        if layout_en:
-            positive_parts.append(layout_en)
-        if style_en:
-            positive_parts.append(style_en)
-        if color_en:
+        # 2. 构图和风格（#1：含中文片段用 _append_english 兜底丢弃，避免中文进英文提示词）
+        self._append_english(positive_parts, layout_en, "layout_formula")
+        self._append_english(positive_parts, style_en, "style")
+        if color_en and not self._contains_cjk(color_en):
             positive_parts.append(f"{color_en} color palette")
+        elif color_en:
+            logging.warning("#1: color_mood 含中文，丢弃: %s", color_en[:50])
 
-        # 3. 核心卖点描述
+        # 3. 核心卖点描述（#1b：优先 core_selling_point_en，缺失回退 _extract_english）
         core = layer_0.get("core_selling_point", "")
-        core_en = self._extract_english(core)
-        if core_en:
-            positive_parts.append(core_en)
+        core_en = layer_0.get("core_selling_point_en") or self._extract_english(core)
+        self._append_english(positive_parts, core_en, "core_selling_point")
 
         # 4. 从选中的替换方案取具体元素描述
         replaceable = layer_3.get("replaceable_elements", {})
         for field_name, item in replaceable.items():
+            # #15：跳过文字槽位--其文案由 _get_pod_hints 统一处理（经 _sanitize 成英文），
+            # 这里再 append 会重复，且 _extract_english 对中文文案无效会原样拼入（中文泄漏）。
+            # 用 _parse_is_text_slot 解析防字符串 "false" 被误判为真。
+            if isinstance(item, dict) and self._parse_is_text_slot(item.get("is_text_slot", False)):
+                continue
             original = item.get("original", "")
-            chosen = changes.get(field_name, original)
-            chosen_en = self._extract_english(chosen)
-            if chosen_en:
-                positive_parts.append(chosen_en)
+            original_en = item.get("original_en") or ""
+            chosen = changes.get(field_name) or original  # #14：不传 default，空串/None 回退原值（避免空自定义值被误判为"已替换"丢元素/进负向）
+            # #1b：chosen 的英文--保持原始用 original_en；替换值先 _extract_english，
+            # 对中文替代值无效时尝试 alternatives_en 索引映射；最终含中文则由 _append_english 丢弃
+            if chosen == original and original_en:
+                chosen_en = original_en
+            else:
+                chosen_en = self._extract_english(chosen)
+                if chosen_en == chosen and chosen != original:
+                    alts = item.get("alternatives", [])
+                    alts_en = item.get("alternatives_en") or []
+                    if alts_en and chosen in alts:
+                        idx = alts.index(chosen)
+                        if idx < len(alts_en):
+                            chosen_en = alts_en[idx]
+            self._append_english(positive_parts, chosen_en, f"replaceable.{field_name}")
 
         # 5. 必备元素
         must_have = layer_2.get("must_have_elements", [])
         for elem in must_have:
+            # #15：跳过文字槽位--其文案由 _get_pod_hints 统一处理（经 _sanitize 成英文），
+            # 这里再 append 会重复（文字槽位同时存在于 must_have 和 replaceable 两层）。
+            if isinstance(elem, dict) and self._parse_is_text_slot(elem.get("is_text_slot", False)):
+                continue
             desc = elem.get("description", "")
-            desc_en = self._extract_english(desc)
-            if desc_en:
-                positive_parts.append(desc_en)
+            desc_en = elem.get("description_en") or self._extract_english(desc)
+            self._append_english(positive_parts, desc_en, "must_have.description")
 
         # 6. 产品适配：画布比例
         canvas_ratio = adaptation.get("canvas_ratio", "")
@@ -823,21 +1099,27 @@ class PromptGenerator:
         if library_recommendations:
             ref_elements = []
             for ref in library_recommendations:
-                # 提取参考图的风格英文部分
+                # 提取参考图的风格英文部分（#1：图库打标是中文，_extract_english 对无 / 的中文原样返回，CJK 丢弃）
                 for s in ref.get("styles", []):
-                    style_en = self._extract_english(s)
-                    if style_en and style_en not in ref_elements:
-                        ref_elements.append(style_en)
+                    s_en = self._extract_english(s)
+                    if s_en and not self._contains_cjk(s_en) and s_en not in ref_elements:
+                        ref_elements.append(s_en)
+                    elif s_en and self._contains_cjk(s_en):
+                        logging.warning("#1: ref style 含中文，丢弃: %s", s_en[:50])
                 # 提取参考图的关键元素
                 for elem in ref.get("elements", []):
-                    elem_en = self._extract_english(elem)
-                    if elem_en and elem_en not in ref_elements:
-                        ref_elements.append(elem_en)
+                    e_en = self._extract_english(elem)
+                    if e_en and not self._contains_cjk(e_en) and e_en not in ref_elements:
+                        ref_elements.append(e_en)
+                    elif e_en and self._contains_cjk(e_en):
+                        logging.warning("#1: ref element 含中文，丢弃: %s", e_en[:50])
             if ref_elements:
                 positive_parts.append("reference style: " + ", ".join(ref_elements[:5]))
 
         # 8. 通用质量词
-        positive_parts.extend(["high quality", "detailed", "professional design"])
+        # R1：正向引导"只画英文文字"——比负向排除更可靠。OpenAI 模式下负向会被
+        # 合并进正向（Do not include: ...），对弱模型有"粉红大象"效应，正向引导是主保障。
+        positive_parts.extend(["high quality", "detailed", "professional design", "english text only"])
 
         # 9. POD 定制要素——从规则卡提取竞品图上的实际文案作示例
         pod_customization_hints = self._get_pod_hints(rule_card)
@@ -854,7 +1136,7 @@ class PromptGenerator:
         # 但其"反面"应该被排除——即原始元素被替换掉的部分
         for field_name, item in replaceable.items():
             original = item.get("original", "")
-            chosen = changes.get(field_name, original)
+            chosen = changes.get(field_name) or original  # #14：不传 default，空串/None 回退原值（避免空自定义值被误判为"已替换"丢元素/进负向）
             if chosen != original:
                 # 被替换掉的原始元素加入 negative
                 original_en = self._extract_english(original)
@@ -869,11 +1151,7 @@ class PromptGenerator:
                 negative_parts.append(neg_en)
 
         # POD 印刷质量排除项
-        pod_negative_additions = [
-            "watermark", "signature", "low resolution",
-            "blurry edges", "unprintable artifacts",
-        ]
-        for neg in pod_negative_additions:
+        for neg in POD_NEGATIVE_ADDITIONS:
             if neg not in negative_parts:
                 negative_parts.append(neg)
 
@@ -907,7 +1185,7 @@ class PromptGenerator:
         replaceable = layer_3.get("replaceable_elements", {})
         for field_name, item in replaceable.items():
             original = item.get("original", "")
-            chosen = changes.get(field_name, original)
+            chosen = changes.get(field_name) or original  # #14：不传 default，空串/None 回退原值（避免空自定义值被误判为"已替换"丢元素/进负向）
             if chosen == original:
                 kept.append(f"{field_name}：{original}（保持原始）")
             else:
@@ -921,3 +1199,60 @@ class PromptGenerator:
     def _extract_english(self, text: str) -> str:
         """从 "中文/English" 格式的文本中提取英文部分（委托给共享的 vocab_utils）"""
         return extract_english_part(text)
+
+    def _contains_cjk(self, text: str) -> bool:
+        """判断 text 是否含 CJK（中日韩）汉字字符。
+
+        只检测中文汉字区间，不波及拉丁扩展字符（如 café/José/Mötley 的重音字母
+        é/ñ/ü 仍是合法的非英文文案，应保留）。覆盖：CJK 统一汉字(4E00-9FFF)、
+        扩展A(3400-4DBF)、兼容(F900-FAFF)、扩展B(20000-2FA1F)。
+        """
+        for c in text:
+            cp = ord(c)
+            if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                    or 0xF900 <= cp <= 0xFAFF or 0x20000 <= cp <= 0x2FA1F):
+                return True
+        return False
+
+    def _append_english(self, parts: list, text: str, field_name: str,
+                        allow_cjk_fallback: bool = False) -> None:
+        """#1：拼接英文片段到正向提示词，堵中文泄漏。
+
+        text 应已是 _en 优先后的值（调用方先尝试 *_en 字段，缺失再回退中文）。
+        含 CJK 时：
+        - allow_cjk_fallback=True（版本A layout/adaptation_notes 等关键构图/适配信息）：
+          保留并 warning（#1b 根因阶段新规则卡应有 _en，此处仅兜底旧数据，不丢信息）。
+        - allow_cjk_fallback=False：丢弃并 warning（避免中文元素描述进英文生图提示词，
+          诱发支持文字渲染的模型画出中文，与 R1 图无中文矛盾）。
+        空值直接跳过。
+        """
+        if not text or not text.strip():
+            return
+        if self._contains_cjk(text):
+            if allow_cjk_fallback:
+                logging.warning("#1: 字段 %s 含中文且无 _en，临时保留: %s", field_name, text[:50])
+                parts.append(text)
+            else:
+                logging.warning("#1: 字段 %s 含中文，丢弃不入英文提示词: %s", field_name, text[:50])
+        else:
+            parts.append(text)
+
+    def _sanitize_text_slot_value(self, dim_name: str, original: str) -> str:
+        """R1：确保文字槽位的示例文案不含中文，避免正向写中文与负向排除中文矛盾。
+
+        生成的图不能出现中文（R1），但 _get_pod_hints 会把竞品图上识别到的真实
+        文案作为示例写进正向提示词。若该文案含中文汉字（如"妈妈花园"），正向
+        要求画中文会与负向排除中文打架，此时按槽位类型用英文占位符替代。
+        纯英文/数字/ASCII 符号（如 "Mom's Garden"、2026）以及带重音的拉丁文
+        （如 café/José，非 CJK）原样返回。
+
+        注意：不使用 _extract_english（它按"中文/English"词表格式 split，对自由
+        文案会误判——纯中文"妈妈花园"无 / 会被原样返回，达不到过滤目的）。
+        判定用 _contains_cjk（只查 CJK 汉字），而非 ord>=128（会误伤拉丁重音）。
+        """
+        if not self._contains_cjk(original):
+            return original
+        dim_lower = dim_name.lower()
+        if "日期" in dim_lower or "date" in dim_lower:
+            return "2026"
+        return "NAME"

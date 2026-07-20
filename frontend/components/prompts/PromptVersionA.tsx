@@ -26,13 +26,14 @@ interface RecommendedImage {
   thumbnail_path?: string;
   /** 综合匹配分数 */
   score?: number;
-  /** 各维度得分 */
-  dimension_scores?: {
+  /** 各维度得分：与后端 recommend_for_rule 返回的 match_details 对齐
+   *  （key: style / color_mood / layout / theme / emotion，见 image_library_store._compute_similarity） */
+  match_details?: {
     style?: number;
-    color?: number;
-    composition?: number;
+    color_mood?: number;
+    layout?: number;
     theme?: number;
-    mood?: number;
+    emotion?: number;
   };
   /** 核心卖点是否匹配 */
   core_matched?: boolean;
@@ -42,11 +43,12 @@ interface RecommendedImage {
 
 /* ── 维度配置（用于渲染分数条） ── */
 const DIMENSION_CONFIG = [
+  // key 与后端 match_details 的维度 key 严格一致（label 是中文展示，weight 仅展示用勿删）
   { key: 'style',       label: '风格', weight: 0.35 },
-  { key: 'color',       label: '色彩', weight: 0.20 },
-  { key: 'composition', label: '构图', weight: 0.20 },
+  { key: 'color_mood',  label: '色彩', weight: 0.20 },
+  { key: 'layout',      label: '构图', weight: 0.20 },
   { key: 'theme',       label: '主题', weight: 0.15 },
-  { key: 'mood',        label: '情绪', weight: 0.10 },
+  { key: 'emotion',     label: '情绪', weight: 0.10 },
 ] as const;
 
 /* ── 组件 Props ── */
@@ -259,7 +261,7 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
               const isSelected = selectedIds.has(img.image_id);
               const isDisabled = !isSelected && selectedIds.size >= MAX_SELECT;
               const isExpanded = expandedIds.has(img.image_id);
-              const hasDimensions = !!img.dimension_scores;
+              const hasDimensions = !!img.match_details;
 
               return (
                 <div
@@ -348,10 +350,10 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
                     )}
 
                     {/* 维度分数条（展开后显示） */}
-                    {isExpanded && img.dimension_scores && (
+                    {isExpanded && img.match_details && (
                       <div className="space-y-1 pt-1">
                         {DIMENSION_CONFIG.map((dim) => {
-                          const val = (img.dimension_scores as Record<string, number | undefined>)[dim.key] ?? 0;
+                          const val = (img.match_details as Record<string, number | undefined>)[dim.key] ?? 0;
                           const pct = Math.min(Math.max(val * 100, 0), 100);
                           return (
                             <div key={dim.key} className="flex items-center gap-1.5">

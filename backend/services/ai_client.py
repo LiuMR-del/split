@@ -2,7 +2,9 @@
 统一 AI 客户端 - 支持 OpenAI 和 Anthropic API 格式
 """
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +13,51 @@ from models.settings import AIModelConfig
 
 # 默认配置文件路径（AI 分析模型配置，与生图配置 gen_config.json 分开存）
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "data" / "config.json"
+
+# AI 文本/图片请求的最大输出 token 上限。
+# 6 层规则卡的中文 JSON 输出量大（含 must_have/replaceable/adaptations 等列表），
+# 4096 易截断导致 JSON 解析失败；加 _en 平行字段后更大，故提到 8192。
+MAX_TOKENS = 8192
+
+# 重试配置：对 429/5xx/超时 做指数退避重试
+_RETRY_MAX_ATTEMPTS = 2      # 最多重试 2 次（共 3 次请求）
+_RETRY_BASE_DELAY = 1.0      # 首次重试等待 1 秒，第二次等待 2 秒
+
+logger = logging.getLogger(__name__)
+
+
+async def _request_with_retry(fn, *args, **kwargs):
+    """带指数退避重试的请求包装器。
+
+    对 httpx.TimeoutException / HTTP 429 / HTTP 5xx 做最多 _RETRY_MAX_ATTEMPTS
+    次重试（退避 1s→2s）。重试耗尽后抛出最后一次的原异常。
+    其他 4xx（如 401/404）不重试，直接抛出。
+    """
+    last_exc = None
+    for attempt in range(_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            if attempt < _RETRY_MAX_ATTEMPTS:
+                delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning("请求超时，第 %d 次重试（%.1fs 后）: %s", attempt + 1, delay, exc)
+                await asyncio.sleep(delay)
+            else:
+                raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 429 or status >= 500:
+                last_exc = exc
+                if attempt < _RETRY_MAX_ATTEMPTS:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning("HTTP %d，第 %d 次重试（%.1fs 后）", status, attempt + 1, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+            else:
+                # 4xx（非 429）不重试
+                raise
 
 
 def load_ai_client_from_config(config_path: Optional[Path] = None) -> Optional["AIClient"]:
@@ -51,28 +98,31 @@ class AIClient:
         system_prompt: str,
         user_prompt: str,
         media_type: str = "image/jpeg",
+        temperature: Optional[float] = None,
     ) -> str:
         """
         发送图片给 VLM 分析，返回文本响应。
         根据 provider 自动选择 OpenAI 或 Anthropic 请求格式。
         media_type: 图片 MIME 类型，如 image/jpeg、image/png、image/webp
+        temperature: 可选，结构化任务传 0（稳定输出），创意任务不传（保持多样性）
         """
         if self.config.provider == "anthropic":
-            return await self._anthropic_image_request(image_base64, system_prompt, user_prompt, media_type)
+            return await self._anthropic_image_request(image_base64, system_prompt, user_prompt, media_type, temperature)
         else:
             # openai 和 custom 都走 OpenAI 兼容格式
-            return await self._openai_image_request(image_base64, system_prompt, user_prompt, media_type)
+            return await self._openai_image_request(image_base64, system_prompt, user_prompt, media_type, temperature)
 
-    async def text_request(self, system_prompt: str, user_prompt: str) -> str:
+    async def text_request(self, system_prompt: str, user_prompt: str, temperature: Optional[float] = None) -> str:
         """
         发送纯文本请求（不带图片），返回文本响应。
         根据 provider 自动选择 OpenAI 或 Anthropic 请求格式。
         供需要纯文本 AI 调用的场景使用（如 prompt_generator 的改款推荐）。
+        temperature: 可选，结构化任务传 0（稳定输出），创意任务不传（保持多样性）
         """
         if self.config.provider == "anthropic":
-            return await self._anthropic_text_request(system_prompt, user_prompt)
+            return await self._anthropic_text_request(system_prompt, user_prompt, temperature)
         else:
-            return await self._openai_text_request(system_prompt, user_prompt)
+            return await self._openai_text_request(system_prompt, user_prompt, temperature)
 
     async def test_connection(self) -> dict:
         """
@@ -95,7 +145,8 @@ class AIClient:
     # -------------------- OpenAI 兼容格式 --------------------
 
     async def _openai_image_request(
-        self, image_base64: str, system_prompt: str, user_prompt: str, media_type: str = "image/jpeg"
+        self, image_base64: str, system_prompt: str, user_prompt: str,
+        media_type: str = "image/jpeg", temperature: Optional[float] = None,
     ) -> str:
         """OpenAI 格式的图片分析请求"""
         url = f"{self.config.api_url.rstrip('/')}/chat/completions"
@@ -118,16 +169,21 @@ class AIClient:
                     ],
                 },
             ],
-            "max_tokens": 4096,
+            "max_tokens": MAX_TOKENS,
         }
+        if temperature is not None:
+            body["temperature"] = temperature
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        async def _do_request():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
 
-    async def _openai_text_request(self, system_prompt: str, user_prompt: str) -> str:
+        return await _request_with_retry(_do_request)
+
+    async def _openai_text_request(self, system_prompt: str, user_prompt: str, temperature: Optional[float] = None) -> str:
         """OpenAI 格式的纯文本请求（不带图片）"""
         url = f"{self.config.api_url.rstrip('/')}/chat/completions"
         headers = {
@@ -140,14 +196,19 @@ class AIClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": 4096,
+            "max_tokens": MAX_TOKENS,
         }
+        if temperature is not None:
+            body["temperature"] = temperature
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        async def _do_request():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+
+        return await _request_with_retry(_do_request)
 
     async def _openai_test(self) -> dict:
         """OpenAI 格式的连接测试（纯文本请求）"""
@@ -187,7 +248,8 @@ class AIClient:
     # -------------------- Anthropic 格式 --------------------
 
     async def _anthropic_image_request(
-        self, image_base64: str, system_prompt: str, user_prompt: str, media_type: str = "image/jpeg"
+        self, image_base64: str, system_prompt: str, user_prompt: str,
+        media_type: str = "image/jpeg", temperature: Optional[float] = None,
     ) -> str:
         """Anthropic 格式的图片分析请求"""
         url = f"{self.config.api_url.rstrip('/')}/messages"
@@ -198,7 +260,7 @@ class AIClient:
         }
         body = {
             "model": self.config.model,
-            "max_tokens": 4096,
+            "max_tokens": MAX_TOKENS,
             "system": system_prompt,
             "messages": [
                 {
@@ -217,18 +279,23 @@ class AIClient:
                 }
             ],
         }
+        if temperature is not None:
+            body["temperature"] = temperature
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            # Anthropic 响应格式：content 是数组，取第一个 text block
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    return block["text"]
-            return ""
+        async def _do_request():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                # Anthropic 响应格式：content 是数组，取第一个 text block
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        return block["text"]
+                return ""
 
-    async def _anthropic_text_request(self, system_prompt: str, user_prompt: str) -> str:
+        return await _request_with_retry(_do_request)
+
+    async def _anthropic_text_request(self, system_prompt: str, user_prompt: str, temperature: Optional[float] = None) -> str:
         """Anthropic 格式的纯文本请求（不带图片）"""
         url = f"{self.config.api_url.rstrip('/')}/messages"
         headers = {
@@ -238,19 +305,24 @@ class AIClient:
         }
         body = {
             "model": self.config.model,
-            "max_tokens": 4096,
+            "max_tokens": MAX_TOKENS,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
+        if temperature is not None:
+            body["temperature"] = temperature
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    return block["text"]
-            return ""
+        async def _do_request():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        return block["text"]
+                return ""
+
+        return await _request_with_retry(_do_request)
 
     async def _anthropic_test(self) -> dict:
         """Anthropic 格式的连接测试（纯文本请求）"""

@@ -15,6 +15,7 @@ from models.rule_card import RuleCard
 from services.rule_store import (
     save_rule,
     get_rule,
+    generate_rule_id,
     list_rules,
     update_rule,
     delete_rule,
@@ -57,15 +58,13 @@ async def create_rule(rule: RuleCard):
     保存新规则卡。
     请求体为完整的 RuleCard JSON。
     """
-    # 检查是否已存在同 ID 的规则
+    # #25：防双标签页同时分析撞 ID--分析时 image_analyzer 预生成 rule_id 供预览，
+    # 保存时若发现已存在（两标签页并发分析未保存导致同 ID），后端重分配新 ID 而非报 409。
     existing = get_rule(rule.rule_id)
     if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"规则卡 {rule.rule_id} 已存在，如需更新请使用 PUT 方法",
-        )
+        rule.rule_id = generate_rule_id()
 
-    save_rule(rule)
+    save_rule(rule, thumbnail_path=rule.thumbnail_path)
     return {
         "success": True,
         "message": f"规则卡 {rule.rule_id} 已保存",

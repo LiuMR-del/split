@@ -6,8 +6,9 @@
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
 from models.settings import AIModelConfig
 from services.ai_client import AIClient
@@ -41,7 +42,7 @@ def _load_ai_config() -> AIModelConfig:
 
 
 @router.post("/analyze")
-async def analyze_image(file: UploadFile = File(...)):
+async def analyze_image(file: UploadFile = File(...), hint: Optional[str] = Form(default="")):
     """
     上传图片并分析。
     1. 保存图片到 data/uploads/（时间戳 + 原文件名）
@@ -59,7 +60,7 @@ async def analyze_image(file: UploadFile = File(...)):
     # 保存上传的图片：用时间戳 + 原文件名避免重名
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time())
-    safe_filename = f"{timestamp}_{file.filename}"
+    safe_filename = f"{timestamp}_{Path(file.filename or 'upload.jpg').name}"  # #5：Path.name 去掉目录分隔符和 ..，防路径穿越
     save_path = UPLOADS_DIR / safe_filename
 
     content = await file.read()
@@ -72,7 +73,8 @@ async def analyze_image(file: UploadFile = File(...)):
 
     # 执行分析
     try:
-        result = await analyzer.analyze(str(save_path))
+        # R2：把用户填写的"分析方向/补充说明"透传给分析器，引导 VLM 分析侧重
+        result = await analyzer.analyze(str(save_path), hint=hint or "")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"图片分析失败: {str(e)}")
 
@@ -84,5 +86,7 @@ async def analyze_image(file: UploadFile = File(...)):
             "sabc_raw": result["sabc_raw"],
             "rule_raw": result["rule_raw"],
             "uploaded_image": f"/uploads/{safe_filename}",
+            # R2：回显用户填的分析方向，便于前端 done 状态展示（可选）
+            "hint": hint or "",
         },
     }

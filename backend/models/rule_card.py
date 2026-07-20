@@ -10,6 +10,7 @@ from datetime import datetime
 class CoreSellingPoint(BaseModel):
     """第 0 层：核心卖点锚定"""
     core_selling_point: str = Field(description="买家下单的直接原因")
+    core_selling_point_en: Optional[str] = Field(default=None, description="核心卖点英文版，用于英文生图提示词")
     selling_point_type: str = Field(description="卖点类型")
     why_it_sells: str = Field(description="为什么驱动下单")
     lock_rule: str = Field(description="锁定规则：什么绝不能改")
@@ -28,6 +29,7 @@ class MustHaveElement(BaseModel):
     """必备元素"""
     slot: str = Field(description="槽位名称")
     description: str = Field(description="元素描述")
+    description_en: Optional[str] = Field(default=None, description="元素描述英文版，用于英文生图提示词")
     position: str = Field(description="位置")
     visual_weight: str = Field(description="视觉权重")
     is_text_slot: bool = Field(default=False, description="是否为文字类槽位（名字/日期/文案等个性化定制文字）")
@@ -36,6 +38,7 @@ class MustHaveElement(BaseModel):
 class VisualStructureLayer(BaseModel):
     """第 2 层：视觉结构层"""
     layout_formula: str = Field(description="构图公式")
+    layout_formula_en: Optional[str] = Field(default=None, description="构图公式英文版，用于英文生图提示词")
     must_have_elements: List[MustHaveElement] = Field(description="必备元素")
     style: str = Field(description="视觉风格")
     color_mood: str = Field(description="色彩情绪")
@@ -45,7 +48,9 @@ class VisualStructureLayer(BaseModel):
 class ReplaceableItem(BaseModel):
     """可替换项"""
     original: str = Field(description="原始值")
+    original_en: Optional[str] = Field(default=None, description="原始值英文版，用于英文生图提示词")
     alternatives: List[str] = Field(description="可替换选项")
+    alternatives_en: Optional[List[str]] = Field(default=None, description="可替换选项英文版列表，用于英文生图提示词")
     is_text_slot: bool = Field(default=False, description="是否为文字类槽位（名字/日期/文案等个性化定制文字）")
 
 
@@ -84,6 +89,7 @@ class RuleCard(BaseModel):
     rule_name: str = Field(description="规则名称")
     reuse_level: str = Field(description="复用等级 S/A/B/C")
     source_images: List[str] = Field(default_factory=list, description="来源图片")
+    thumbnail_path: str = Field(default="", description="缩略图路径，格式 /uploads/xxx.jpg")
     created_date: str = Field(description="创建日期")
     last_updated: str = Field(description="最后更新日期")
 

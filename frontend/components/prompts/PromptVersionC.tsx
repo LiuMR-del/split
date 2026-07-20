@@ -12,6 +12,7 @@ import Select from '@/components/ui/Select';
 import Card from '@/components/ui/Card';
 import ProductSelect from '@/components/prompts/ProductSelect';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
+import { getCustomValuesForRule, addCustomValue } from '@/lib/localStorage';
 
 interface PromptVersionCProps {
   ruleId: string;
@@ -35,6 +36,24 @@ interface TemplateData {
   locked_fields: LockedField[];
   selectable_fields: TemplateField[];
   product_options: Array<{ label: string; value: string }>;
+}
+
+/* R5：把本地存储的历史自定义值合并进模板的各维度 options。
+ * 历史值带 ✏️ 前缀，与原始选项去重后追加。这样下次打开同规则卡，自定义过的值
+ * 直接出现在下拉框可点选，不用重新打字。
+ * createdDate 用于校验归属（rule_id 可能被复用，用 created_date 区分新旧规则卡）。 */
+function mergeCustomOptions(template: TemplateData, ruleId: string, createdDate: string): TemplateData {
+  const customs = getCustomValuesForRule(ruleId, createdDate);
+  return {
+    ...template,
+    selectable_fields: template.selectable_fields.map((field) => {
+      const existingValues = new Set(field.options.map((o) => o.value));
+      const customOpts = (customs[field.field_name] || [])
+        .filter((v) => v && !existingValues.has(v))
+        .map((v) => ({ label: `✏️ ${v}`, value: v, is_original: false }));
+      return { ...field, options: [...field.options, ...customOpts] };
+    }),
+  };
 }
 
 export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps) {
@@ -67,7 +86,9 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
         const res = await apiGet<any>(`/api/prompts/template-c/${ruleId}`);
         // 后端返回 {"success": true, "data": {...}}
         const tmpl: TemplateData = unwrapData(res);
-        setTemplate(tmpl);
+        // R5：合并本地存储的历史自定义值到各维度 options，下次打开可直接点选。
+        // 传 created_date 校验归属，防 rule_id 复用导致旧规则卡的自定义值污染新卡
+        setTemplate(mergeCustomOptions(tmpl, ruleId, ruleCard?.created_date || ''));
 
         /* 初始化各维度的默认选中值（选original） */
         const defaultSelections: Record<string, string> = {};
@@ -128,11 +149,33 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
     setError('');
     setResult(null);
 
+    // R5：把本次输入的自定义值（不在已知 options 里的）落盘到本地，下次可复用
+    const createdDate = ruleCard?.created_date || '';
+    if (template) {
+      template.selectable_fields.forEach((field) => {
+        const val = selections[field.field_name];
+        if (!val || val.trim() === '__custom__') return;
+        const knownValues = new Set(field.options.map((o) => o.value));
+        if (!knownValues.has(val)) {
+          addCustomValue(ruleId, createdDate, field.field_name, val);
+        }
+      });
+      // 落盘后重合并 template，让"恢复下拉"即时看到刚输入的值，不用刷新页面
+      setTemplate((prev) => (prev ? mergeCustomOptions(prev, ruleId, createdDate) : prev));
+    }
+
     try {
+      // #14：剔除空值和哨兵 __custom__，避免发 {"field_name": ""} 给后端导致该维度被误判为"已替换"（丢元素+进负向）
+      // 前端为根因修复，后端 changes.get(field) or original 为兜底，双保险
+      const cleanSelections = Object.fromEntries(
+        Object.entries(selections).filter(
+          ([, v]) => v && v.trim() && v.trim() !== '__custom__'
+        )
+      );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiPost<any>('/api/prompts/generate-c', {
         rule_id: ruleId,
-        selections,
+        selections: cleanSelections,
         target_product: targetProduct,
       });
       // 后端返回 {"success": true, "data": {...}}

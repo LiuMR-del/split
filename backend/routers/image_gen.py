@@ -9,6 +9,8 @@
 - POST /api/gen/download/{task_id} → 下载远端图片到本地
 """
 
+import asyncio
+import logging
 import json
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ from services.image_gen_store import (
     delete_task,
     download_images,
     generate_task_id,
+    GEN_TASKS_DIR,
 )
 
 router = APIRouter(prefix="/gen", tags=["生图"])
@@ -144,46 +147,88 @@ async def submit_gen_task(request: ImageGenRequest):
     submitted_tasks = []
     errors = []
 
-    for i in range(request.count):
+    async def _submit_one(idx: int):
+        """提交单个生图任务。返回 task.model_dump()（成功）或 {"index":idx+1,"error":...}（失败）。
+        #8：抽出协程，供 AIReiter 并发 / OpenAI 串行 复用。"""
         task_id = generate_task_id()
-
         try:
-            # 提交到远端
             result = await client.submit_task(
                 prompt=prompt,
                 width=request.width,
                 height=request.height,
                 negative_prompt=request.prompt_negative,
             )
-
-            # 判断是否 OpenAI 同步模式（submit 直接返回完成状态 + 图片）
             is_sync_completed = result.get("status") == "completed" and result.get("image_urls")
+            # #17：OpenAI 同步模式 _openai_generate 恒返 "completed"，无图说明 API 调用成功但未出图
+            # （内容策略拒绝/配额耗尽），判 failed，不落僵尸 completed。AIReiter 不受影响。
+            is_openai_no_image = (
+                config.api_type == "openai"
+                and not is_sync_completed
+                and result.get("status") == "completed"
+            )
+            if is_openai_no_image:
+                final_status = "failed"
+                final_error = "生图 API 未返回图片（可能内容策略拒绝或配额耗尽）"
+                final_completed_at = now
+            else:
+                final_status = "completed" if is_sync_completed else result.get("status", "pending")
+                final_error = ""
+                final_completed_at = now if is_sync_completed else ""
 
-            # 创建本地任务记录
             task = ImageGenTask(
                 task_id=task_id,
                 out_task_id=result["out_task_id"],
                 rule_id=request.rule_id,
                 rule_name=request.rule_name,
                 version=request.version,
-                status="completed" if is_sync_completed else result.get("status", "pending"),
+                status=final_status,
                 prompt_positive=request.prompt_positive,
                 prompt_negative=request.prompt_negative,
                 width=request.width,
                 height=request.height,
                 image_urls=result.get("image_urls", []) if is_sync_completed else [],
                 estimated_credits=result.get("estimated_credits", 0),
+                error=final_error,
                 created_at=now,
-                completed_at=now if is_sync_completed else "",
+                completed_at=final_completed_at,
             )
             save_task(task)
-            submitted_tasks.append(task.model_dump())
-
+            return task.model_dump()
         except Exception as e:
-            errors.append({
-                "index": i + 1,
-                "error": str(e),
-            })
+            logging.exception("生图任务提交失败 index=%d", idx + 1)
+            # #9：清理本次失败的占位文件（generate_task_id 已写占位占号，失败不清理会留垃圾+烧编号）
+            try:
+                placeholder = GEN_TASKS_DIR / f"{task_id}.json"
+                if placeholder.exists():
+                    placeholder.unlink()
+            except Exception:
+                pass
+            return {"index": idx + 1, "error": str(e)}
+
+    # #8：按 api_type 分支提交。
+    # AIReiter 异步模式 submit 不等出图（只是提交），限流压力小，asyncio.gather 并发总耗时≈单次；
+    # OpenAI 同步模式 submit 等出图（30-120s/张），图片 API 限流严（Tier 1 个位数 RPM），
+    # 并发会集体触发 429（比串行更糟），保持串行。
+    if config.api_type == "aireiter":
+        raw_results = await asyncio.gather(
+            *[_submit_one(i) for i in range(request.count)],
+            return_exceptions=True,
+        )
+        for r in raw_results:
+            if isinstance(r, Exception):
+                errors.append({"index": 0, "error": str(r)})  # gather 未预期异常双保险
+            elif isinstance(r, dict) and "error" in r:
+                errors.append(r)
+            else:
+                submitted_tasks.append(r)
+    else:
+        # OpenAI 串行
+        for i in range(request.count):
+            r = await _submit_one(i)
+            if isinstance(r, dict) and "error" in r:
+                errors.append(r)
+            else:
+                submitted_tasks.append(r)
 
     if not submitted_tasks and errors:
         raise HTTPException(

@@ -109,13 +109,15 @@ class ImageGenClient:
             "size": size,
         }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # 上游代理出图耗时不稳定（实测 60 秒~4 分钟），120 秒会把"慢"误判成"错"报 500，
+        # 放宽到 300 秒覆盖慢峰（浏览器 fetch 默认超时约 300 秒，再大前端也等不到）
+        async with httpx.AsyncClient(timeout=300.0) as client:
             try:
                 resp = await client.post(url, json=body, headers=self._headers())
             except httpx.ConnectError:
                 raise Exception("无法连接到生图 API 服务器")
             except httpx.TimeoutException:
-                raise Exception("生图请求超时（120秒）")
+                raise Exception("生图请求超时（300秒），上游出图过慢，请稍后重试")
 
             try:
                 data = resp.json()

@@ -99,12 +99,36 @@ async def fetch_models(config: AIModelConfig):
     headers = {
         "Authorization": f"Bearer {config.api_key}",
     }
-    # Anthropic 不支持模型列表 API
+    # Anthropic: 尝试实时拉取模型列表（GET /v1/models, 需 x-api-key + anthropic-version）
     if config.provider == "anthropic":
+        anthropic_headers = {
+            "x-api-key": config.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{api_url}/models", headers=anthropic_headers
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = []
+                    for m in data.get("data", []):
+                        models.append({
+                            "id": m.get("id", ""),
+                            "name": m.get("display_name", m.get("id", "")),
+                        })
+                    models.sort(key=lambda x: x["name"])
+                    return {"models": models}
+        except Exception:
+            pass
+        # 实时拉取失败时回退到硬编码列表（可手动更新）
         return {"models": [
             {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
             {"id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
-            {"id": "claude-haiku-4-20250414", "name": "Claude Haiku 4"},
+            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
+            {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5"},
         ]}
 
     try:

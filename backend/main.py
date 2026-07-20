@@ -20,10 +20,14 @@ from services.image_gen_store import init_image_gen_db
 
 app = FastAPI(title="竞品图案规则拆解系统 API")
 
-# CORS 中间件配置，允许前端 localhost:3000 访问
+# CORS 中间件配置
+# 显式列出允许的前端 origin（allow_credentials=True 时 Starlette 拒绝通配符 *）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
