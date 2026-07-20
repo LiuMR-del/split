@@ -1,30 +1,57 @@
 @import "tailwindcss";
 
 /* ========================================
- * Codex 深色主题配置
- * 使用 Tailwind v4 的 @theme 指令定义色板
+ * Codex 主题配置（暗色默认 + 浅色可选）
+ * :root 定义暗色默认值（与改造前像素级一致），html.light 覆盖为浅色值，
+ * theme 指令里令牌名不变，只是把值从字面量换成对 root 变量的引用，
+ * 全部组件的 bg-codex 系列类名零改动。
  * ======================================== */
 
+:root {
+  --theme-bg: #0d1117;
+  --theme-card: #161b22;
+  --theme-border: #30363d;
+  --theme-text: #e6edf3;
+  --theme-text-secondary: #8b949e;
+  --theme-accent: #58a6ff;
+  --theme-success: #3fb950;
+  --theme-warning: #d29922;
+  --theme-danger: #f85149;
+}
+
+html.light {
+  /* GitHub Light 色系，与暗色对应色板保持相近的语义强度 */
+  --theme-bg: #ffffff;
+  --theme-card: #f6f8fa;
+  --theme-border: #d0d7de;
+  --theme-text: #1f2328;
+  --theme-text-secondary: #59636e;
+  --theme-accent: #0969da;
+  --theme-success: #1a7f37;
+  --theme-warning: #9a6700;
+  --theme-danger: #d1242f;
+}
+
 @theme inline {
-  /* Codex 深色色板 */
-  --color-codex-bg: #0d1117;
-  --color-codex-card: #161b22;
-  --color-codex-border: #30363d;
-  --color-codex-text: #e6edf3;
-  --color-codex-text-secondary: #8b949e;
-  --color-codex-accent: #58a6ff;
-  --color-codex-success: #3fb950;
-  --color-codex-warning: #d29922;
-  --color-codex-danger: #f85149;
+  /* Codex 色板令牌：值来自上面的 --theme-*，随 html.light 类切换 */
+  --color-codex-bg: var(--theme-bg);
+  --color-codex-card: var(--theme-card);
+  --color-codex-border: var(--theme-border);
+  --color-codex-text: var(--theme-text);
+  --color-codex-text-secondary: var(--theme-text-secondary);
+  --color-codex-accent: var(--theme-accent);
+  --color-codex-success: var(--theme-success);
+  --color-codex-warning: var(--theme-warning);
+  --color-codex-danger: var(--theme-danger);
 
   /* Mono 等宽字体族 */
   --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
 }
 
-/* 全局样式：深色背景 + 浅色文字 + 等宽字体 */
+/* 全局样式：背景 + 文字 + 等宽字体，颜色随主题变量变化 */
 body {
-  background-color: #0d1117;
-  color: #e6edf3;
+  background-color: var(--theme-bg);
+  color: var(--theme-text);
   font-family: var(--font-mono);
 }
 
@@ -35,14 +62,14 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #0d1117;
+  background: var(--theme-bg);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #30363d;
+  background: var(--theme-border);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #8b949e;
+  background: var(--theme-text-secondary);
 }

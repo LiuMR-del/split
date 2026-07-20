@@ -155,7 +155,7 @@ function CodeBlock({
       <div className="relative">
         <pre
           className="
-            bg-[#0d1117] border border-codex-border rounded-lg p-3
+            bg-codex-bg border border-codex-border rounded-lg p-3
             overflow-x-auto
             text-sm font-mono text-codex-text
             whitespace-pre-wrap break-words
@@ -259,7 +259,7 @@ function MergedPromptBlock({
             value={editedPrompt}
             onChange={(e) => setEditedPrompt(e.target.value)}
             className="
-              bg-[#0d1117] border border-codex-border rounded-lg p-3
+              bg-codex-bg border border-codex-border rounded-lg p-3
               text-sm font-mono text-codex-text
               w-full overflow-hidden
               focus:outline-none focus:border-codex-accent
@@ -269,7 +269,7 @@ function MergedPromptBlock({
           /* 只读模式：pre 代码块 */
           <pre
             className="
-              bg-[#0d1117] border border-codex-border rounded-lg p-3
+              bg-codex-bg border border-codex-border rounded-lg p-3
               overflow-x-auto
               text-sm font-mono text-codex-text
               whitespace-pre-wrap break-words
@@ -362,7 +362,7 @@ function CollapsiblePromptBlock({
       <div className="relative">
         <pre
           className="
-            bg-[#0d1117] border border-codex-border rounded-lg p-3
+            bg-codex-bg border border-codex-border rounded-lg p-3
             overflow-x-auto
             text-sm font-mono text-codex-text
             whitespace-pre-wrap break-words
@@ -1069,7 +1069,7 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
             ref={previewTextareaRef}
             value={finalPositive ?? effectivePositive}
             onChange={(e) => setFinalPositive(e.target.value)}
-            className="bg-[#0d1117] border border-codex-border rounded-lg p-3 text-sm font-mono text-codex-text w-full overflow-hidden focus:outline-none focus:border-codex-accent"
+            className="bg-codex-bg border border-codex-border rounded-lg p-3 text-sm font-mono text-codex-text w-full overflow-hidden focus:outline-none focus:border-codex-accent"
           />
           <p className="text-xs font-mono text-codex-text-secondary mt-1">
             勾选项已拼入，可在此微调后用于生图；改勾选会重新拼接

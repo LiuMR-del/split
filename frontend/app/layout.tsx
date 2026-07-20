@@ -15,7 +15,18 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className="h-full">
+    <html lang="zh-CN" className="h-full" suppressHydrationWarning>
+      <head>
+        {/* 主题防闪烁（FOUC）：内联脚本在浏览器解析 HTML 时同步执行，
+            赶在首次绘制前把 localStorage 存的主题类加到 <html> 上。
+            默认暗色（不存在或非 light 值都不加 class），只有存了 'light' 才加。
+            参考 Next.js 官方文档 preventing-flash-before-hydration.md 的 Themes 一节。 */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{if(localStorage.getItem("split:theme")==="light")document.documentElement.classList.add("light")}catch(e){}})()`,
+          }}
+        />
+      </head>
       <body className="min-h-full font-mono bg-codex-bg text-codex-text">
         {/* 侧边栏导航 */}
         <Sidebar />

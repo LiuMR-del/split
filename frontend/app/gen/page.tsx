@@ -491,7 +491,7 @@ export default function GenPage() {
                                       <h4 className="text-xs font-mono font-bold text-codex-text">
                                         🖼️ 正向提示词
                                       </h4>
-                                      <pre className="bg-[#0d1117] border border-codex-border rounded-lg p-3 text-xs font-mono text-codex-text whitespace-pre-wrap break-words">
+                                      <pre className="bg-codex-bg border border-codex-border rounded-lg p-3 text-xs font-mono text-codex-text whitespace-pre-wrap break-words">
                                         {task.prompt_positive}
                                       </pre>
                                     </div>
@@ -501,7 +501,7 @@ export default function GenPage() {
                                       <h4 className="text-xs font-mono font-bold text-codex-text">
                                         🚫 负向提示词
                                       </h4>
-                                      <pre className="bg-[#0d1117] border border-codex-border rounded-lg p-3 text-xs font-mono text-codex-text whitespace-pre-wrap break-words">
+                                      <pre className="bg-codex-bg border border-codex-border rounded-lg p-3 text-xs font-mono text-codex-text whitespace-pre-wrap break-words">
                                         {task.prompt_negative}
                                       </pre>
                                     </div>
