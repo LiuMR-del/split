@@ -53,6 +53,11 @@ gen_images_dir = Path(__file__).parent / "data" / "gen" / "images"
 gen_images_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/gen-images", StaticFiles(directory=str(gen_images_dir)), name="gen-images")
 
+# 静态文件服务：挂载 data/gen/refs 目录到 /gen-refs（生图流程参考图上传）
+gen_refs_dir = Path(__file__).parent / "data" / "gen" / "refs"
+gen_refs_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/gen-refs", StaticFiles(directory=str(gen_refs_dir)), name="gen-refs")
+
 # 注册路由
 app.include_router(settings_router, prefix="/api")
 app.include_router(analyze_router, prefix="/api")

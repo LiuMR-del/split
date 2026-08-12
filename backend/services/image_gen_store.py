@@ -72,12 +72,15 @@ def init_image_gen_db():
             json_path TEXT NOT NULL
         )
     """)
-    # 兼容已有数据库：旧表可能没有 rule_name/version 列，用 ALTER TABLE 补上
+    # 兼容已有数据库：旧表可能没有 rule_name/version/used_reference 列，用 ALTER TABLE 补上
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(image_gen_tasks)").fetchall()}
     if "rule_name" not in existing_cols:
         conn.execute("ALTER TABLE image_gen_tasks ADD COLUMN rule_name TEXT DEFAULT ''")
     if "version" not in existing_cols:
         conn.execute("ALTER TABLE image_gen_tasks ADD COLUMN version TEXT DEFAULT ''")
+    if "used_reference" not in existing_cols:
+        # #7：INTEGER 存布尔（SQLite 惯例），0=False/1=True
+        conn.execute("ALTER TABLE image_gen_tasks ADD COLUMN used_reference INTEGER DEFAULT 0")
     # 创建索引加速查询
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_gen_tasks_rule_id
@@ -109,8 +112,8 @@ def save_task(task: ImageGenTask) -> None:
         INSERT OR REPLACE INTO image_gen_tasks
         (task_id, out_task_id, rule_id, rule_name, version, status, prompt_positive, prompt_negative,
          width, height, image_urls, local_images, error, estimated_credits,
-         created_at, completed_at, json_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         created_at, completed_at, used_reference, json_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         task.task_id,
         task.out_task_id,
@@ -128,6 +131,7 @@ def save_task(task: ImageGenTask) -> None:
         task.estimated_credits,
         task.created_at,
         task.completed_at,
+        1 if task.used_reference else 0,
         str(json_path),
     ))
     conn.commit()
@@ -224,7 +228,7 @@ def list_tasks(
         SELECT task_id, out_task_id, rule_id, rule_name, version, status,
                prompt_positive, prompt_negative, width, height,
                image_urls, local_images, error, estimated_credits,
-               created_at, completed_at
+               created_at, completed_at, used_reference
         FROM image_gen_tasks
         {where_clause}
         ORDER BY created_at DESC
@@ -254,6 +258,7 @@ def list_tasks(
             "estimated_credits": row["estimated_credits"],
             "created_at": row["created_at"],
             "completed_at": row["completed_at"],
+            "used_reference": bool(row["used_reference"]),
         })
 
     total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0

@@ -143,9 +143,11 @@ async def get_template_c(rule_id: str):
             detail=f"规则卡 {rule_id} 不存在",
         )
 
-    # 生成模板
-    generator = PromptGenerator()
-    template = generator.generate_version_c_template(rule_card=rule.model_dump())
+    # 生成模板。#4b：传 ai_client 供纯英文选项加中文小字翻译；未配置 AI 时
+    # generate_version_c_template 内部会跳过翻译，不影响模板本身正常返回
+    ai_client = load_ai_client_from_config()
+    generator = PromptGenerator(ai_client=ai_client)
+    template = await generator.generate_version_c_template(rule_card=rule.model_dump())
 
     return {
         "success": True,

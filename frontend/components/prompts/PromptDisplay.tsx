@@ -13,7 +13,8 @@ import Card from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import CollapsibleSection from '@/components/ui/CollapsibleSection';
-import { apiPost, apiGet, unwrapData } from '@/lib/api';
+import FileUpload from '@/components/ui/FileUpload';
+import { apiPost, apiGet, apiUpload, unwrapData } from '@/lib/api';
 
 /* 提示词生成结果类型 */
 export interface PromptResult {
@@ -44,6 +45,9 @@ export interface PromptResult {
   image_prompt_positive: string;
   /* 英文生图提示词 - 负向 */
   image_prompt_negative: string;
+  /* #7：编辑指令式提示词——配合竞品原图一起发给生图 API 时用（只说"改哪里"，
+   * 不重新描述整个设计），与 image_prompt_positive（完整描述式）并存 */
+  image_prompt_edit?: string;
   /* 改款说明 */
   change_summary: {
     kept: string[];
@@ -69,6 +73,10 @@ interface PromptDisplayProps {
   ruleName?: string;
   /** 提示词来自哪个版本：A(资料库关联)/B(AI推荐)/C(自定义模板)，用于生图任务页分组 */
   version?: 'A' | 'B' | 'C';
+  /** #7：规则卡是否有竞品原图（source_images 非空），决定"附带竞品原图"开关是否可用 */
+  hasRuleImage?: boolean;
+  /** #7：竞品原图的完整可访问 URL（取 ruleCard.thumbnail_path），用于开关旁的小缩略图预览 */
+  ruleImageUrl?: string;
 }
 
 /* 生图提交响应 */
@@ -543,12 +551,24 @@ function ImageGenSection({
   version,
   promptPositive,
   promptNegative,
+  attachRuleImage,
+  referencePaths,
+  onReferencePathsChange,
+  onAppendFragment,
 }: {
   ruleId: string;
   ruleName?: string;
   version?: 'A' | 'B' | 'C';
   promptPositive: string;
   promptNegative: string;
+  /** #7：是否附带规则卡竞品原图生图（即上方"附带竞品原图"开关的当前状态） */
+  attachRuleImage: boolean;
+  /** #8：额外参考图路径列表（生图流程参考图上传，与规则卡竞品原图一起作为图片输入附带） */
+  referencePaths: string[];
+  /** #8：新增/删除参考图时回调给父组件（PromptDisplay 维护实际 state） */
+  onReferencePathsChange: (paths: string[]) => void;
+  /** #8：点"拼入提示词"时把分析出的英文片段追加到父组件当前激活模式的提示词 */
+  onAppendFragment: (fragment: string) => void;
 }) {
   /* 产品尺寸预设选中值 */
   const [sizePreset, setSizePreset] = useState('square');
@@ -606,6 +626,88 @@ function ImageGenSection({
   const handleHeightChange = (v: number) => {
     setHeight(v || 1024);
     setSizePreset('');
+  };
+
+  /* #8：生图流程参考图上传——每一项是用户添加的一张待处理参考图（选图→填用途→AI分析→拼入）。
+   * 用本地数组维护多张，每项独立 purpose 分析、独立拼入/删除，不影响其他项。 */
+  const [refItems, setRefItems] = useState<Array<{
+    file: File;
+    preview: string;
+    purpose: string;
+    analyzing: boolean;
+    error: string;
+    fragment: string;        // AI 分析出的英文片段，用户可编辑
+    descriptionCn: string;   // AI 分析出的中文说明（只读展示）
+    refPath: string;         // 分析成功后端返回的 /gen-refs/xxx 路径，空串表示还没分析成功
+    appended: boolean;       // 是否已点过"拼入提示词"
+  }>>([]);
+
+  /* 添加一张待处理参考图（选图后先只是待分析状态，不立即调用 AI） */
+  const handleAddRefImage = (file: File) => {
+    setRefItems((prev) => [...prev, {
+      file,
+      preview: URL.createObjectURL(file),
+      purpose: '',
+      analyzing: false,
+      error: '',
+      fragment: '',
+      descriptionCn: '',
+      refPath: '',
+      appended: false,
+    }]);
+  };
+
+  /* 更新某一项的用途文本 */
+  const handleRefPurposeChange = (idx: number, purpose: string) => {
+    setRefItems((prev) => prev.map((item, i) => i === idx ? { ...item, purpose } : item));
+  };
+
+  /* 调 AI 分析这张参考图（只提取 purpose 相关的特征） */
+  const handleAnalyzeRef = async (idx: number) => {
+    const item = refItems[idx];
+    if (!item || !item.purpose.trim()) return;
+
+    setRefItems((prev) => prev.map((it, i) => i === idx ? { ...it, analyzing: true, error: '' } : it));
+
+    try {
+      const formData = new FormData();
+      formData.append('file', item.file);
+      formData.append('purpose', item.purpose.trim());
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = await apiUpload<any>('/api/gen/analyze-ref', formData);
+      const data = unwrapData<any>(res); // eslint-disable-line @typescript-eslint/no-explicit-any
+      setRefItems((prev) => prev.map((it, i) => i === idx ? {
+        ...it,
+        analyzing: false,
+        fragment: data.fragment || '',
+        descriptionCn: data.description_cn || '',
+        refPath: data.ref_path || '',
+      } : it));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'AI 分析失败';
+      setRefItems((prev) => prev.map((it, i) => i === idx ? { ...it, analyzing: false, error: msg } : it));
+    }
+  };
+
+  /* 拼入提示词：把编辑后的英文片段追加到父组件当前激活的提示词末尾，
+   * 并把 ref_path 加进 referencePaths（提交生图时随竞品原图一起作为图片输入附带） */
+  const handleAppendRef = (idx: number) => {
+    const item = refItems[idx];
+    if (!item || !item.fragment.trim()) return;
+    onAppendFragment(item.fragment.trim());
+    if (item.refPath && !referencePaths.includes(item.refPath)) {
+      onReferencePathsChange([...referencePaths, item.refPath]);
+    }
+    setRefItems((prev) => prev.map((it, i) => i === idx ? { ...it, appended: true } : it));
+  };
+
+  /* 删除已添加项：从本地列表移除，并同步从 referencePaths 摘除（如果已拼入过） */
+  const handleRemoveRef = (idx: number) => {
+    const item = refItems[idx];
+    if (item?.refPath) {
+      onReferencePathsChange(referencePaths.filter((p) => p !== item.refPath));
+    }
+    setRefItems((prev) => prev.filter((_, i) => i !== idx));
   };
 
   /* 清理轮询 */
@@ -700,6 +802,8 @@ function ImageGenSection({
         width: submitWidth,
         height: submitHeight,
         count,
+        attach_rule_image: attachRuleImage,
+        reference_image_paths: referencePaths,
       });
       // 后端返回 {submitted, tasks: [{task_id, ...}], errors}（裸数据，unwrapData 原样透传）
       const data = unwrapData<any>(res);
@@ -803,6 +907,80 @@ function ImageGenSection({
         </div>
       </div>
 
+      {/* #8：生图流程参考图上传——折叠区，默认收起（不是每次生图都需要额外参考图，
+          收起减少视觉干扰）。支持添加多张，每张独立填写用途+AI分析+拼入/删除。 */}
+      <CollapsibleSection title="➕ 添加参考图" defaultExpanded={false}>
+        <div className="space-y-3">
+          {refItems.map((item, idx) => (
+            <div key={idx} className="p-3 bg-codex-bg border border-codex-border rounded-md space-y-2">
+              <div className="flex items-start gap-3">
+                <img
+                  src={item.preview}
+                  alt="参考图预览"
+                  className="w-16 h-16 rounded object-cover border border-codex-border shrink-0"
+                />
+                <div className="flex-1 min-w-0 space-y-2">
+                  <input
+                    type="text"
+                    value={item.purpose}
+                    onChange={(e) => handleRefPurposeChange(idx, e.target.value)}
+                    placeholder="这张图的作用，如：主体角色参考 / 配色参考 / 构图参考"
+                    disabled={item.analyzing || !!item.refPath}
+                    className="w-full px-2 py-1.5 text-sm font-mono bg-codex-card text-codex-text border border-codex-border rounded-md placeholder:text-codex-text-secondary/50 focus:outline-none focus:border-codex-accent disabled:opacity-60"
+                  />
+                  {!item.refPath && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => handleAnalyzeRef(idx)}
+                      loading={item.analyzing}
+                      disabled={!item.purpose.trim()}
+                    >
+                      🔍 AI 分析并入提示词
+                    </Button>
+                  )}
+                </div>
+                <button
+                  onClick={() => handleRemoveRef(idx)}
+                  className="text-xs font-mono text-codex-text-secondary hover:text-codex-danger transition-colors cursor-pointer shrink-0"
+                  title="删除这张参考图"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {item.error && (
+                <p className="text-xs font-mono text-codex-danger">❌ {item.error}</p>
+              )}
+
+              {item.refPath && (
+                <div className="space-y-2 pt-2 border-t border-codex-border">
+                  <p className="text-xs font-mono text-codex-text-secondary">
+                    💡 {item.descriptionCn}
+                  </p>
+                  <textarea
+                    value={item.fragment}
+                    onChange={(e) => setRefItems((prev) => prev.map((it, i) => i === idx ? { ...it, fragment: e.target.value, appended: false } : it))}
+                    className="w-full px-2 py-1.5 text-xs font-mono bg-codex-card text-codex-text border border-codex-border rounded-md focus:outline-none focus:border-codex-accent"
+                    rows={2}
+                  />
+                  <Button
+                    variant={item.appended ? 'secondary' : 'primary'}
+                    size="sm"
+                    onClick={() => handleAppendRef(idx)}
+                    disabled={!item.fragment.trim()}
+                  >
+                    {item.appended ? '✅ 已拼入（可再次点击重新拼入）' : '➕ 拼入提示词'}
+                  </Button>
+                </div>
+              )}
+            </div>
+          ))}
+
+          <FileUpload onFileSelect={handleAddRefImage} />
+        </div>
+      </CollapsibleSection>
+
       {/* 生成按钮 */}
       <Button
         variant="primary"
@@ -897,12 +1075,65 @@ function ImageGenSection({
   );
 }
 
-export default function PromptDisplay({ result, ruleId, ruleName, version }: PromptDisplayProps) {
+/* R4：把用户勾选的可定制项英文片段拼到 base 提示词末尾。抽成纯函数供
+ * effectivePositive（完整描述模式）和 effectiveEdit（#7 编辑指令模式）共用，
+ * 两种 base 拼接逻辑完全一致，不重复维护两份。
+ * 拼接前去掉 base 尾部的逗号/空格（用户手改可能留下），避免 "xxx, , fragment" 双逗号；
+ * base 被清空时直接用 fragments，避免前导逗号。 */
+function applyFragments(base: string, fragments: string[]): string {
+  if (!fragments.length) return base;
+  const trimmedBase = base.replace(/[，,\s]+$/, '').trim();
+  return trimmedBase
+    ? `${trimmedBase}, ${fragments.join(', ')}, each customizable element appears only once`
+    : `${fragments.join(', ')}, each customizable element appears only once`;
+}
+
+/* #7：GET /api/gen/config 的 supports_reference 结果模块级缓存——A/B/C 三版各自
+ * 渲染一个 PromptDisplay 实例，都要用这个值，缓存后只需请求一次，不用三份重复请求。
+ * null 表示还没取过。 */
+let _supportsReferenceCache: boolean | null = null;
+
+export default function PromptDisplay({ result, ruleId, ruleName, version, hasRuleImage, ruleImageUrl }: PromptDisplayProps) {
   /* R3：维护"编辑后"的提示词 state，初始取 result 的值，result 变化（重新生成）时重置。
    * MergedPromptBlock 编辑完成时回写这里，ImageGenSection 用这里的值生图，
    * 修复原 bug：编辑后显示/生图仍是原值。R4 将在此基础上叠加可定制项勾选片段。 */
   const [editablePositive, setEditablePositive] = useState(result.image_prompt_positive);
   const [editableNegative, setEditableNegative] = useState(result.image_prompt_negative);
+  /* #7：编辑指令式提示词的编辑态，随 result 同步的模式和 editablePositive 一致 */
+  const [editableEdit, setEditableEdit] = useState(result.image_prompt_edit || '');
+  /* #7：当前生图接口是否支持带参考图（GET /api/gen/config 的 supports_reference，
+   * 挂载时取一次，用模块级缓存避免 A/B/C 三个 PromptDisplay 实例各发一次请求） */
+  const [supportsReference, setSupportsReference] = useState<boolean>(_supportsReferenceCache ?? false);
+  useEffect(() => {
+    if (_supportsReferenceCache !== null) return;
+    let cancelled = false;
+    apiGet<any>('/api/gen/config') // eslint-disable-line @typescript-eslint/no-explicit-any
+      .then((res) => {
+        const supports = Boolean(unwrapData<any>(res)?.supports_reference); // eslint-disable-line @typescript-eslint/no-explicit-any
+        _supportsReferenceCache = supports;
+        if (!cancelled) setSupportsReference(supports);
+      })
+      .catch(() => {
+        _supportsReferenceCache = false;
+        if (!cancelled) setSupportsReference(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+  /* #7：是否使用"附带竞品原图"编辑模式。初始值：有竞品图 + 后端返回了编辑指令提示词
+   * + 当前接口支持带图，三者都满足才默认开启；否则默认关闭（回落完整描述模式）。
+   * 不支持/无图时下面的开关会被禁用，用户改不了这个初始判断。 */
+  const [useReference, setUseReference] = useState(
+    Boolean(hasRuleImage) && Boolean(result.image_prompt_edit) && supportsReference
+  );
+  /* #7：supportsReference 首次渲染时可能还没从 GET /api/gen/config 异步拉回来
+   * （缓存未命中时初始是 false），拉回来之后要重新结算一次默认值——但只在"还没
+   * 手动切换过开关"时结算，避免覆盖用户已经做出的选择。用 ref 记录是否已经手动切过。 */
+  const userToggledRef = useRef(false);
+  useEffect(() => {
+    if (userToggledRef.current) return;
+    setUseReference(Boolean(hasRuleImage) && Boolean(result.image_prompt_edit) && supportsReference);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supportsReference, result.image_prompt_edit, hasRuleImage]);
   /* R4：可定制项勾选状态，记录被选中项的索引数组。默认全不选（符合"可选可不选，未选则不改"） */
   const [selectedSlotIndices, setSelectedSlotIndices] = useState<number[]>([]);
   /* R3：editable 提示词的持久化 state。初始取 result 的值；重新生成时由 setResult(null)
@@ -912,7 +1143,8 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
   useEffect(() => {
     setEditablePositive(result.image_prompt_positive);
     setEditableNegative(result.image_prompt_negative);
-  }, [result.image_prompt_positive, result.image_prompt_negative]);
+    setEditableEdit(result.image_prompt_edit || '');
+  }, [result.image_prompt_positive, result.image_prompt_negative, result.image_prompt_edit]);
   /* R4：勾选状态跟随可定制项变化（重新生成时重置），单独 effect 避免影响 editable */
   useEffect(() => {
     setSelectedSlotIndices([]);
@@ -926,22 +1158,46 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
     .filter((_, i) => selectedSlotIndices.includes(i))
     .map((s) => s.prompt_fragment)
     .filter(Boolean);
-  /* 拼接前去掉 base 尾部的逗号/空格（用户手改可能留下），避免 "xxx, , fragment" 双逗号；
-   * base 被清空时直接用 fragments，避免前导逗号 */
-  const trimmedBase = editablePositive.replace(/[，,\s]+$/, '').trim();
-  const effectivePositive = selectedFragments.length
-    ? (trimmedBase
-        ? `${trimmedBase}, ${selectedFragments.join(', ')}, each customizable element appears only once`
-        : `${selectedFragments.join(', ')}, each customizable element appears only once`)
-    : editablePositive;
+  const effectivePositive = applyFragments(editablePositive, selectedFragments);
+  /* #7：编辑指令模式下的等效拼接——同样的 base+fragment 拼接逻辑，只是 base 换成
+   * editableEdit（编辑指令文本）而不是 editablePositive（完整描述文本） */
+  const effectiveEdit = applyFragments(editableEdit, selectedFragments);
+  /* #7：当前实际激活的文本（供 MergedPromptBlock 显示、生图使用）——
+   * 开关开着且确有编辑指令文本时用编辑指令模式，否则回落完整描述模式 */
+  const activeEffective = useReference && editableEdit ? effectiveEdit : effectivePositive;
   /* R5：finalPositive 是用户在"实际生图提示词"预览块里编辑后的最终值（含勾选项）。
-   * 默认 undefined（用 effectivePositive 自动拼接）；用户编辑预览块后覆盖。
-   * base 或勾选变化时重置为 undefined（重新用 effectivePositive），避免编辑值与勾选状态脱节。 */
+   * 默认 undefined（用 activeEffective 自动拼接）；用户编辑预览块后覆盖。
+   * base 或勾选变化时重置为 undefined（重新用 activeEffective），避免编辑值与勾选状态脱节。
+   * #7：依赖也加 useReference/editableEdit——切换模式应视为"重新拼接"，不能让上一个
+   * 模式编辑过的旧值继续覆盖新模式的文本。 */
   const [finalPositive, setFinalPositive] = useState<string | undefined>(undefined);
   useEffect(() => {
     setFinalPositive(undefined);
-  }, [editablePositive, selectedSlotIndices]);
-  const imageGenPositive = finalPositive ?? effectivePositive;
+  }, [editablePositive, editableEdit, useReference, selectedSlotIndices]);
+  /* #8：额外参考图路径列表（批次五：生图流程参考图上传）。用户在 ImageGenSection
+   * 的"添加参考图"折叠区上传+AI分析后，点"拼入提示词"经 onAppendFragment 追加到
+   * 当前激活模式的 base；提交生图时随 attach_rule_image 一起传给后端。 */
+  const [referencePaths, setReferencePaths] = useState<string[]>([]);
+  /* #8：把参考图分析出的英文片段追加到当前激活模式（编辑指令/完整描述）的 base 末尾，
+   * 保持勾选状态不变——这是"新增类"追加而非替换，不需要像 MergedPromptBlock 完成编辑
+   * 那样复位勾选框。追加到 base 而不是 activeEffective，避免下次勾选变化时被覆盖丢失。
+   * 不复用 applyFragments——那个函数末尾固定拼"each customizable element appears
+   * only once"，是专为可定制项勾选设计的收尾句，参考图片段（如色彩/构图描述）拼上
+   * 这句话语义不通，这里只做简单的逗号追加。 */
+  const handleAppendFragment = (fragment: string) => {
+    const trimmed = fragment.trim();
+    if (!trimmed) return;
+    const append = (base: string) => {
+      const trimmedBase = base.replace(/[，,\s]+$/, '').trim();
+      return trimmedBase ? `${trimmedBase}, ${trimmed}` : trimmed;
+    };
+    if (useReference && editableEdit) {
+      setEditableEdit(append);
+    } else {
+      setEditablePositive(append);
+    }
+  };
+  const imageGenPositive = finalPositive ?? activeEffective;
   /* R5：预览块 textarea 也 auto-resize，对齐生图提示词编辑框的大小（不再固定高度） */
   const previewTextareaRef = useAutoResizeTextarea([imageGenPositive, selectedSlotIndices]);
 
@@ -1020,17 +1276,70 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
         </Card>
       )}
 
+      {/* #7：附带竞品原图开关——放在 MergedPromptBlock 正上方。只有"有竞品图 + 后端
+          返回了编辑指令提示词 + 当前生图接口支持带图"三者都满足才可用，否则置灰
+          并显示原因，用户点不了一个实际生效不了的开关。 */}
+      {(() => {
+        const noRuleImage = !hasRuleImage;
+        const noEditPrompt = !result.image_prompt_edit;
+        const notSupported = !supportsReference;
+        const disabled = noRuleImage || noEditPrompt || notSupported;
+        const disabledReason = notSupported
+          ? '当前生图接口不支持参考图'
+          : noRuleImage
+            ? '该规则卡无竞品原图'
+            : noEditPrompt
+              ? '该版本暂未生成编辑指令提示词'
+              : '';
+        return (
+          <div className="flex items-center gap-3 px-3 py-2 bg-codex-card border border-codex-border rounded-md">
+            <label className={`flex items-center gap-2 text-sm font-mono ${disabled ? 'text-codex-text-secondary cursor-not-allowed' : 'text-codex-text cursor-pointer'}`}>
+              <input
+                type="checkbox"
+                checked={useReference && !disabled}
+                disabled={disabled}
+                onChange={(e) => {
+                  userToggledRef.current = true;
+                  setUseReference(e.target.checked);
+                }}
+                className="cursor-pointer accent-codex-accent disabled:cursor-not-allowed"
+              />
+              🖼️ 附带竞品原图（编辑模式）
+            </label>
+            {disabled && disabledReason && (
+              <span className="text-xs font-mono text-codex-text-secondary">（{disabledReason}）</span>
+            )}
+            {!disabled && ruleImageUrl && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={ruleImageUrl}
+                alt="竞品原图"
+                className="w-8 h-8 rounded object-cover border border-codex-border"
+                onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+              />
+            )}
+          </div>
+        );
+      })()}
+
       {/* 📝 生图提示词（正向+负向合并）。二期批次一：positive 改传 effectivePositive，
           让顶部编辑区直接显示"base + 已勾选片段"的完整内容，不用再看隐藏的预览框才能确认拼接结果。
+          #7：改传 activeEffective——开关开着时显示编辑指令模式的拼接结果，否则完整描述模式。
           折叠交互与"中文结构化提示词"一致，默认展开（这是最常用的核心内容）。 */}
       <CollapsibleSection title="📝 生图提示词" defaultExpanded={true}>
         <MergedPromptBlock
-          positive={effectivePositive}
+          positive={activeEffective}
           negative={editableNegative}
           onPromptChange={(p, n) => {
-            setEditablePositive(p);
+            /* #7：完成编辑时回写到当前激活模式的 base（edit 或 positive），
+               两套编辑互不覆盖——用户在编辑指令模式下改的内容不会污染完整描述模式的 base，反之亦然 */
+            if (useReference && editableEdit) {
+              setEditableEdit(p);
+            } else {
+              setEditablePositive(p);
+            }
             setEditableNegative(n);
-            /* 用户完成编辑时，已勾选片段已随 effectivePositive 一起"烤入" p 成为新 base，
+            /* 用户完成编辑时，已勾选片段已随 activeEffective 一起"烤入" p 成为新 base，
                勾选框复位避免二次拼接重复（不复位会导致同一片段被拼两次） */
             setSelectedSlotIndices([]);
           }}
@@ -1057,9 +1366,9 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
 
       {/* R4：勾选了可定制项时，展示实际将用于生图的完整正向提示词（base + 勾选片段），
        * 让用户直观确认拼接结果，避免"勾了但不知道加没加"的困惑。
-       * 二期批次一：默认隐藏——上方 MergedPromptBlock 已直接显示 effectivePositive，
+       * 二期批次一：默认隐藏——上方 MergedPromptBlock 已直接显示 activeEffective，
        * 这个预览框变得多余；finalPositive/previewTextareaRef state 保留不删，
-       * 隐藏后不再被触发，imageGenPositive 自然回落 effectivePositive。 */}
+       * 隐藏后不再被触发，imageGenPositive 自然回落 activeEffective。 */}
       {SHOW_FINAL_PREVIEW_BOX && selectedSlotIndices.length > 0 && selectedFragments.length > 0 && (
         <Card className="border-l-4 border-l-cyan-700 bg-codex-card">
           <h4 className="text-sm font-mono font-bold text-cyan-400 mb-2">
@@ -1067,7 +1376,7 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
           </h4>
           <textarea
             ref={previewTextareaRef}
-            value={finalPositive ?? effectivePositive}
+            value={finalPositive ?? activeEffective}
             onChange={(e) => setFinalPositive(e.target.value)}
             className="bg-codex-bg border border-codex-border rounded-lg p-3 text-sm font-mono text-codex-text w-full overflow-hidden focus:outline-none focus:border-codex-accent"
           />
@@ -1132,8 +1441,10 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
       )}
 
       {/* 🖼️ 一键生图区域（需要 ruleId）。
-          R4：promptPositive 用 effectivePositive（编辑后 base + 勾选的 fragment），
+          R4：promptPositive 用 imageGenPositive（激活模式的 base + 勾选的 fragment），
           promptNegative 仍用 editableNegative（可定制项只影响正向）。
+          #7：attachRuleImage 传当前开关状态（=useReference），后端据此决定是否真的
+          把竞品原图编码传给生图 API；referencePaths 本批次恒 []，批次五启用。
           折叠交互与"中文结构化提示词"一致，默认展开。 */}
       {ruleId && (
         <CollapsibleSection title="🖼️ 生成图片" defaultExpanded={true} titleColorClass="text-purple-400">
@@ -1143,6 +1454,10 @@ export default function PromptDisplay({ result, ruleId, ruleName, version }: Pro
             version={version}
             promptPositive={imageGenPositive}
             promptNegative={editableNegative}
+            attachRuleImage={useReference}
+            referencePaths={referencePaths}
+            onReferencePathsChange={setReferencePaths}
+            onAppendFragment={handleAppendFragment}
           />
         </CollapsibleSection>
       )}

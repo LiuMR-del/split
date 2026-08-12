@@ -3,11 +3,19 @@
 """
 
 import uuid
-from typing import Optional
+import base64
+from typing import Optional, List
 
 import httpx
 
 from models.image_gen import ImageGenConfig
+
+# #7：批次三 Spike 结论——仅 OpenAI 模式的 /v1/images/edits 确认支持带参考图
+# （用竞品图+编辑指令实测，生成结果真的保留了原图构图/风格，只替换了指定元素）。
+# AIReiter 模式当前环境无法验证：项目配置的 api_url 实际是自建代理，没有实现
+# AIReiter 原生 /api/openapi/submit 路由（不管带不带图都 404）；真正的 aireiter.com
+# 域名在当前网络环境 DNS 无法解析。不能假设 AIReiter 支持带图，保持 False。
+REFERENCE_SUPPORT = {"openai": True, "aireiter": False}
 
 
 class ImageGenClient:
@@ -17,12 +25,13 @@ class ImageGenClient:
         self.config = config
         self.base_url = config.api_url.rstrip("/")
 
-    def _headers(self) -> dict:
-        """构建请求头"""
-        return {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _headers(self, include_content_type: bool = True) -> dict:
+        """构建请求头。multipart 请求（/v1/images/edits）不能手动设 Content-Type
+        （httpx 需要自己生成带 boundary 的 multipart/form-data），所以加开关。"""
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
 
     # ==================== 统一入口 ====================
 
@@ -32,6 +41,7 @@ class ImageGenClient:
         width: int = 1024,
         height: int = 1024,
         negative_prompt: str = "",
+        reference_images: Optional[List[dict]] = None,
     ) -> dict:
         """
         提交生图任务。
@@ -40,6 +50,14 @@ class ImageGenClient:
         - "openai"   → 同步调用 /v1/images/generations，直接返回图片
         - "aireiter" → 异步提交到 submit 接口，后续需要 poll
 
+        参数:
+            reference_images: 参考图列表，每项 {"b64": str, "mime": str}（见
+                image_format_utils.prepare_image_for_vlm 的返回格式）。#7：仅
+                OpenAI 模式实际使用（切换到 /v1/images/edits）；AIReiter 模式
+                当前不支持（REFERENCE_SUPPORT），传了也会被忽略，调用方
+                （routers/image_gen.py）应先查 REFERENCE_SUPPORT 再决定要不要
+                准备这些图，避免白做图片预处理的开销。
+
         返回:
             openai 模式:
                 {"out_task_id": str, "status": "completed", "image_urls": list}
@@ -47,7 +65,7 @@ class ImageGenClient:
                 {"out_task_id": str, "status": str, "task_id": str, "estimated_credits": float}
         """
         if self.config.api_type == "openai":
-            return await self._openai_generate(prompt, negative_prompt, width, height)
+            return await self._openai_generate(prompt, negative_prompt, width, height, reference_images)
         else:
             return await self._aireiter_submit(prompt, negative_prompt, width, height)
 
@@ -89,10 +107,15 @@ class ImageGenClient:
         negative_prompt: str,
         width: int,
         height: int,
+        reference_images: Optional[List[dict]] = None,
     ) -> dict:
-        """OpenAI 同步生图（gpt-image-2 等）"""
+        """OpenAI 同步生图（gpt-image-2 等）。
+
+        #7：有参考图时切 /v1/images/edits（multipart，真正带图生成，Spike 已验证）；
+        无图走现状 /v1/images/generations（纯文本）。两分支共用 negative_prompt 合并、
+        size 转换、响应解析逻辑。
+        """
         out_task_id = f"split-{uuid.uuid4().hex[:12]}"
-        url = f"{self.base_url}/v1/images/generations"
 
         # gpt-image-2 不支持 negative_prompt，合并到正向提示词里
         full_prompt = prompt
@@ -102,22 +125,49 @@ class ImageGenClient:
         # 把 width x height 转成 OpenAI 支持的 size 字符串
         size = self._get_openai_size(width, height)
 
-        body = {
-            "model": self.config.model,
-            "prompt": full_prompt,
-            "n": 1,
-            "size": size,
-        }
-
-        # 上游代理出图耗时不稳定（实测 60 秒~4 分钟），120 秒会把"慢"误判成"错"报 500，
-        # 放宽到 300 秒覆盖慢峰（浏览器 fetch 默认超时约 300 秒，再大前端也等不到）
+        # 上游代理出图耗时不稳定（实测 60 秒~4 分钟，带图编辑更慢），120 秒会把
+        # "慢"误判成"错"报 500，放宽到 300 秒覆盖慢峰
         async with httpx.AsyncClient(timeout=300.0) as client:
-            try:
-                resp = await client.post(url, json=body, headers=self._headers())
-            except httpx.ConnectError:
-                raise Exception("无法连接到生图 API 服务器")
-            except httpx.TimeoutException:
-                raise Exception("生图请求超时（300秒），上游出图过慢，请稍后重试")
+            if reference_images:
+                url = f"{self.base_url}/v1/images/edits"
+                # #7：multipart 请求——httpx 需要自己生成带 boundary 的
+                # multipart/form-data，_headers(include_content_type=False)
+                # 不手动设 Content-Type，交给 httpx 处理
+                files = []
+                for i, ref in enumerate(reference_images):
+                    img_bytes = base64.b64decode(ref["b64"])
+                    mime = ref.get("mime", "image/jpeg")
+                    ext = mime.split("/")[-1] if "/" in mime else "jpg"
+                    files.append(("image[]", (f"ref_{i}.{ext}", img_bytes, mime)))
+                data = {
+                    "model": self.config.model,
+                    "prompt": full_prompt,
+                    "n": "1",
+                    "size": size,
+                }
+                try:
+                    resp = await client.post(
+                        url, files=files, data=data,
+                        headers=self._headers(include_content_type=False),
+                    )
+                except httpx.ConnectError:
+                    raise Exception("无法连接到生图 API 服务器")
+                except httpx.TimeoutException:
+                    raise Exception("生图请求超时（300秒），上游出图过慢，请稍后重试")
+            else:
+                url = f"{self.base_url}/v1/images/generations"
+                body = {
+                    "model": self.config.model,
+                    "prompt": full_prompt,
+                    "n": 1,
+                    "size": size,
+                }
+                try:
+                    resp = await client.post(url, json=body, headers=self._headers())
+                except httpx.ConnectError:
+                    raise Exception("无法连接到生图 API 服务器")
+                except httpx.TimeoutException:
+                    raise Exception("生图请求超时（300秒），上游出图过慢，请稍后重试")
 
             try:
                 data = resp.json()

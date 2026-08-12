@@ -28,7 +28,9 @@ interface PromptVersionCProps {
 interface TemplateField {
   field_name: string;
   label: string;
-  options: Array<{ label: string; value: string; is_original?: boolean }>;
+  /** #4b：label_cn 是后端 AI 翻译出的中文小字提示（仅纯英文选项才有），
+   * 只用于下拉框展示，不影响 value（不会拼进最终提示词） */
+  options: Array<{ label: string; value: string; is_original?: boolean; label_cn?: string }>;
 }
 
 interface LockedField {
@@ -294,10 +296,16 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
                   </button>
                 </div>
               ) : (
-                /* 普通下拉模式：末尾加"自定义..."选项 */
+                /* 普通下拉模式：末尾加"自定义..."选项。
+                   #4b：纯英文选项后面拼上 label_cn（如 "Dachshund (腊肠犬)"）方便选择，
+                   原生 <select>/<option> 不支持不同字号的复合样式，只能是纯文本拼接，
+                   不是真正的"小字体"，但足够解决"看不懂英文选项"的问题。 */
                 <Select
                   options={[
-                    ...field.options,
+                    ...field.options.map((opt) => ({
+                      ...opt,
+                      label: opt.label_cn ? `${opt.label} (${opt.label_cn})` : opt.label,
+                    })),
                     { label: '✏️ 自定义...', value: '__custom__' },
                   ]}
                   value={selections[field.field_name] || ''}
@@ -356,6 +364,8 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
           ruleId={ruleId}
           ruleName={ruleCard?.rule_name}
           version="C"
+          hasRuleImage={Boolean(ruleCard?.source_images?.length)}
+          ruleImageUrl={ruleCard?.thumbnail_path || ''}
         />
       )}
     </div>

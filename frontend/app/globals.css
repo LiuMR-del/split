@@ -1,13 +1,14 @@
 @import "tailwindcss";
 
 /* ========================================
- * Codex 主题配置（暗色默认 + 浅色可选）
- * :root 定义暗色默认值（与改造前像素级一致），html.light 覆盖为浅色值，
- * theme 指令里令牌名不变，只是把值从字面量换成对 root 变量的引用，
- * 全部组件的 bg-codex 系列类名零改动。
+ * Codex 主题配置（支持浅色/暗色切换）
+ * :root 存暗色默认值，html.light 覆盖为浅色值，
+ * @theme inline 的 token 引用这些变量而非固定值，
+ * 这样 <html> 加/去 light class 即可整体切换，全站 codex-* class 名不用改
  * ======================================== */
 
 :root {
+  /* Codex 深色色板（默认） */
   --theme-bg: #0d1117;
   --theme-card: #161b22;
   --theme-border: #30363d;
@@ -20,7 +21,7 @@
 }
 
 html.light {
-  /* GitHub Light 色系，与暗色对应色板保持相近的语义强度 */
+  /* GitHub Light 色系 */
   --theme-bg: #ffffff;
   --theme-card: #f6f8fa;
   --theme-border: #d0d7de;
@@ -33,7 +34,7 @@ html.light {
 }
 
 @theme inline {
-  /* Codex 色板令牌：值来自上面的 --theme-*，随 html.light 类切换 */
+  /* 令牌名不变，值改为引用 CSS 变量，配合 @theme inline 语义生成的 utility class 运行时可变 */
   --color-codex-bg: var(--theme-bg);
   --color-codex-card: var(--theme-card);
   --color-codex-border: var(--theme-border);
@@ -48,14 +49,14 @@ html.light {
   --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
 }
 
-/* 全局样式：背景 + 文字 + 等宽字体，颜色随主题变量变化 */
+/* 全局样式：主题背景 + 主题文字 + 等宽字体 */
 body {
   background-color: var(--theme-bg);
   color: var(--theme-text);
   font-family: var(--font-mono);
 }
 
-/* 滚动条深色适配 */
+/* 滚动条主题适配 */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

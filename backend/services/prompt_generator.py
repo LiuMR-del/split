@@ -11,7 +11,7 @@ import json
 import logging
 from typing import List, Optional
 
-from prompts.prompt_generation import get_recommendation_prompt, get_customization_analysis_prompt
+from prompts.prompt_generation import get_recommendation_prompt, get_customization_analysis_prompt, get_option_translation_prompt
 from services.ai_response_utils import extract_json_from_ai_response
 from services.vocab_utils import extract_english_part
 
@@ -127,7 +127,7 @@ class PromptGenerator:
         # 组装英文生图提示词
         image_prompt_positive, image_prompt_negative = self._build_image_prompts(
             rule_card, layer_0, layer_2, layer_3, recommended_changes, recommended, adaptation,
-            library_recommendations=library_recommendations,
+            target_product, library_recommendations=library_recommendations,
         )
 
         # 生成改款说明
@@ -148,6 +148,18 @@ class PromptGenerator:
                 "changed_to": val,
             })
 
+        # #7：编辑指令式提示词（image_prompt_edit）——modifications 直接从 layer_3
+        # 原始 item（非 recommended_changes_detail 里已字符串化的值）取，才能用上
+        # original_en/alternatives_en 做语言映射（见 _edit_value_for_original/_chosen）
+        edit_modifications = []
+        for dim, val in recommended_changes.items():
+            item = replaceable.get(dim, {})
+            original_val = self._edit_value_for_original(item)
+            chosen_val = self._edit_value_for_chosen(item, val)
+            if chosen_val != original_val:
+                edit_modifications.append(f"Replace {original_val} with {chosen_val}.")
+        image_prompt_edit = self._build_edit_prompt(target_product, edit_modifications)
+
         return {
             "locked_core": locked_core,
             "recommended_changes": recommended_changes,
@@ -156,6 +168,7 @@ class PromptGenerator:
             "structured_prompt_cn": structured_prompt_cn,
             "image_prompt_positive": image_prompt_positive,
             "image_prompt_negative": image_prompt_negative,
+            "image_prompt_edit": image_prompt_edit,
             "change_summary": change_summary,
             # R4：可定制项列表，前端展示为可选 checkbox，勾选后其 prompt_fragment 拼入生图提示词
             "customization_slots": customization_slots,
@@ -231,61 +244,76 @@ class PromptGenerator:
         # 3. 获取产品适配规则
         adaptation = self._get_adaptation(layer4, target_product)
 
-        # 4. 构建英文正向提示词——结构化融合参考图特征
-        prompt_parts = []  # type: List[str]
+        # 4. #4：构建英文正向提示词——按语义分段（与 _build_image_prompts 同款模板），
+        # 换行分隔而非逗号拼一整行。target_product 之前从未进入过这版提示词，这次补上。
+        composition_parts = []  # type: List[str]
+        style_parts = []        # type: List[str]
+        reference_note = ""     # type: str  # 参考元素是"提示"不是"必须画"，独立一句而非塞进 MUST include
 
-        # 核心构图（从规则卡）。#1b：优先 layout_formula_en（VLM 英文输出），缺失回退中文。
-        # layout 是关键构图信息，无 _en 时保留中文+warning（不丢信息），根因后 _en 覆盖。
+        # 核心构图（从规则卡）+ 参考图构图特征。#1b：优先 layout_formula_en（VLM 英文输出），
+        # 缺失回退中文。layout 是关键构图信息，无 _en 时保留中文+warning（不丢信息）。
         layout_formula = layer2.get("layout_formula", "")
         layout_en = layer2.get("layout_formula_en") or layout_formula
-        self._append_english(prompt_parts, layout_en, "layout_formula", allow_cjk_fallback=True)
+        self._append_english(composition_parts, layout_en, "layout_formula", allow_cjk_fallback=True)
+        if ref_composition:
+            composition_parts.append("composition reference: {}".format(', '.join(ref_composition)))
+
+        # 产品适配说明（怎么把设计放到目标产品上，本质是构图相关信息）
+        adapt_notes = adaptation.get("adaptation_notes", "")
+        # #6：不再拼 canvas_ratio 到英文提示词——规则卡里的画布比例和用户在生图
+        # 界面实选的宽高可能矛盾（如规则卡记录 1:1 但用户选了 3:4 竖版毯子），
+        # 以实选尺寸为准，比例约束改由 image_gen.py submit 时前置（见 _ratio_text）。
+        # 中文结构化提示词里的画布比例展示不受影响，仍照常显示。
+        if adapt_notes:
+            # #1：adaptation_notes 可能是中文（如"通用适配"），关键适配信息保留+warning（不丢）
+            self._append_english(composition_parts, adapt_notes, "adaptation_notes", allow_cjk_fallback=True)
 
         # 参考图风格融合（ref_visual_style 元素已 CJK 过滤，fallback 用 _append_english 兜底）
         if ref_visual_style:
-            prompt_parts.append("{} style".format(', '.join(ref_visual_style)))
+            style_parts.append("{} style".format(', '.join(ref_visual_style)))
         else:
             fallback_style = self._extract_english(layer2.get("style", ""))
-            self._append_english(prompt_parts, fallback_style, "fallback_style")
+            self._append_english(style_parts, fallback_style, "fallback_style")
 
         # 参考图色彩融合
         if ref_color_palette:
-            prompt_parts.append("{} color palette".format(', '.join(ref_color_palette)))
+            style_parts.append("{} color palette".format(', '.join(ref_color_palette)))
         else:
             fallback_color = self._extract_english(layer2.get("color_mood", ""))
             if fallback_color and not self._contains_cjk(fallback_color):
-                prompt_parts.append(fallback_color)
+                style_parts.append(fallback_color)
             elif fallback_color:
                 logging.warning("#1: fallback color_mood 含中文，丢弃: %s", fallback_color[:50])
 
-        # 参考图构图融合
-        if ref_composition:
-            prompt_parts.append("composition: {}".format(', '.join(ref_composition)))
-
-        # 参考图元素（作为参考提示，不是必须画的）
+        # 参考图元素（作为参考提示，不是必须画的——保留原语义，独立一句不进 MUST include）
         if ref_elements:
-            prompt_parts.append(
-                "design elements reference: {}".format(', '.join(ref_elements[:5]))
-            )
+            reference_note = "design elements reference: {}".format(', '.join(ref_elements[:5]))
 
-        # 产品适配
-        ratio = adaptation.get("canvas_ratio", "")
-        adapt_notes = adaptation.get("adaptation_notes", "")
-        if ratio:
-            prompt_parts.append("aspect ratio {}".format(ratio))
-        if adapt_notes:
-            # #1：adaptation_notes 可能是中文（如"通用适配"），关键适配信息保留+warning（不丢）
-            self._append_english(prompt_parts, adapt_notes, "adaptation_notes", allow_cjk_fallback=True)
-
-        # POD 定制要素
+        # POD 定制要素：_get_pod_hints 返回 [文字定制句, "clean printable design",
+        # "high resolution..."]，前者归 Personalization，后两条质量要求归 Requirements
         pod_hints = self._get_pod_hints(rule_card)
-        prompt_parts.extend(pod_hints)
+        personalization_line = pod_hints[0] if pod_hints else ""
+        requirements_parts = list(pod_hints[1:]) if pod_hints else []
 
         # 通用质量
         # R1：正向引导"只画英文文字"——比负向排除更可靠。OpenAI 模式下负向会被
         # 合并进正向（Do not include: ...），对弱模型有"粉红大象"效应，正向引导是主保障。
-        prompt_parts.extend(["high quality", "detailed", "professional design", "english text only"])
+        requirements_parts.extend(["english text only", "high quality", "detailed", "professional design"])
 
-        positive = ", ".join([p for p in prompt_parts if p])
+        product_en = self._extract_product_name_en(target_product)
+        lines = [f"Create a {product_en} print-on-demand design."]
+        if composition_parts:
+            lines.append("Composition: " + ", ".join(composition_parts) + ".")
+        if style_parts:
+            lines.append("Style: " + ", ".join(style_parts) + ".")
+        if reference_note:
+            lines.append(reference_note + ".")
+        if personalization_line:
+            lines.append("Personalization: " + personalization_line + ".")
+        if requirements_parts:
+            lines.append("Requirements: " + ", ".join(requirements_parts) + ".")
+
+        positive = "\n".join(lines)
 
         # 5. 构建负向提示词
         negative_parts = list(COMMON_NEGATIVE_PROMPTS)
@@ -355,11 +383,25 @@ class PromptGenerator:
 
         # R4：可定制项--有 AI 走 AI 分析判断，无 AI 走规则卡兜底
         customization_slots = await self._get_customization_slots_with_ai_fallback(rule_card)
+
+        # #7：编辑指令式提示词——版本A没有"元素替换"概念（不是从规则卡替换某个维度，
+        # 是基于参考图做风格迁移），modifications 是风格/色彩/构图指令，只有实际提取到
+        # 对应特征的才生成对应一条
+        edit_modifications = []
+        if ref_visual_style:
+            edit_modifications.append(f"Restyle with: {', '.join(ref_visual_style)} style.")
+        if ref_color_palette:
+            edit_modifications.append(f"Recolor with: {', '.join(ref_color_palette)} palette.")
+        if ref_composition:
+            edit_modifications.append(f"Adjust composition to: {', '.join(ref_composition)}.")
+        image_prompt_edit = self._build_edit_prompt(target_product, edit_modifications)
+
         return {
             "locked_core": locked_core,
             "structured_prompt_cn": structured_cn,
             "image_prompt_positive": positive,
             "image_prompt_negative": negative,
+            "image_prompt_edit": image_prompt_edit,
             "change_summary": change_summary,
             "reference_images_used": [
                 img.get('image_id', '') for img in reference_images
@@ -370,7 +412,7 @@ class PromptGenerator:
 
     # ==================== 版本 C：自定义模板版 ====================
 
-    def generate_version_c_template(self, rule_card: dict) -> dict:
+    async def generate_version_c_template(self, rule_card: dict) -> dict:
         """版本 C：自定义模板版
 
         基于规则卡的第3层可变边界，生成前端下拉框选项结构。
@@ -412,6 +454,12 @@ class PromptGenerator:
                 "options": options,
             })
 
+        # #4b：给纯英文的选项加中文小字翻译（只前端展示用，不进最终提示词）。
+        # original/alternatives 是 VLM 对每张图自由生成的值（犬种名称、装饰组合等），
+        # 不是受控词表固定选项，没有现成中英对照表，只能临时调 AI 翻译；
+        # 翻译结果不影响 value/is_original，翻错不影响生图，容错空间大。
+        await self._translate_english_options(selectable_fields)
+
         # 3. 产品类型选项：从第4层的 adaptations keys 生成
         product_options = []
         adaptations = layer_4.get("adaptations", {})
@@ -423,6 +471,58 @@ class PromptGenerator:
             "selectable_fields": selectable_fields,
             "product_options": product_options,
         }
+
+    async def _translate_english_options(self, selectable_fields: list) -> None:
+        """#4b：给 selectable_fields 里纯英文的 option 就地加 label_cn 字段。
+
+        只翻译 value 本身不含 CJK 字符的选项（判断用 value 而非 label，因为 label
+        可能带"（原始）"这种中文后缀，用 value 更干净）；纯数字/符号（如尺寸值）
+        不含字母，翻译没有意义，也跳过。无 AI 客户端、AI 调用失败、JSON 解析失败
+        时都直接跳过——这只是锦上添花的小字提示，不应该因为翻译失败而影响整个
+        模板接口的可用性。
+        """
+        if not self.ai_client:
+            return
+
+        # 收集去重（同一个英文值可能在多个维度里重复出现，只翻一次）
+        terms = []  # type: List[str]
+        seen = set()
+        for field in selectable_fields:
+            for opt in field.get("options", []):
+                value = opt.get("value", "")
+                if not value or self._contains_cjk(value):
+                    continue
+                if not any(c.isalpha() for c in value):
+                    continue  # 纯数字/符号，没有翻译的意义
+                if value not in seen:
+                    seen.add(value)
+                    terms.append(value)
+
+        if not terms:
+            return
+
+        system_prompt = get_option_translation_prompt(json.dumps(terms, ensure_ascii=False))
+        result = await self._call_ai_for_json(
+            system_prompt, "请严格按 JSON 格式输出翻译结果。", temperature=0,
+        )
+        if not result or "parse_error" in result:
+            logging.warning("#4b: 版本C选项翻译失败，跳过（不影响下拉框正常使用）")
+            return
+
+        translations = result.get("translations", [])
+        if len(translations) != len(terms):
+            logging.warning(
+                "#4b: 版本C选项翻译结果数量(%d)与请求数量(%d)不符，跳过",
+                len(translations), len(terms),
+            )
+            return
+
+        term_to_cn = dict(zip(terms, translations))
+        for field in selectable_fields:
+            for opt in field.get("options", []):
+                cn = term_to_cn.get(opt.get("value", ""))
+                if cn:
+                    opt["label_cn"] = cn
 
     # ==================== 版本 C：根据用户选择生成 ====================
 
@@ -472,11 +572,27 @@ class PromptGenerator:
         }
         image_prompt_positive, image_prompt_negative = self._build_image_prompts(
             rule_card, layer_0, layer_2, layer_3, recommended_changes, recommended_info, adaptation,
-            library_recommendations=library_recommendations,
+            target_product, library_recommendations=library_recommendations,
         )
 
         # 生成改款说明
         change_summary = self._build_change_summary(layer_3, recommended_changes, locked_core)
+
+        # #7：编辑指令式提示词——判断"哪些维度真的变了"复用 _build_change_summary 同款
+        # 标准（chosen = changes.get(field) or original，chosen == original 才算没变），
+        # 不重新发明一套判断逻辑，避免两处标准不一致
+        replaceable = layer_3.get("replaceable_elements", {})
+        edit_modifications = []
+        for field_name, item in replaceable.items():
+            original = item.get("original", "") if isinstance(item, dict) else str(item or "")
+            chosen = recommended_changes.get(field_name) or original
+            if chosen == original:
+                continue
+            original_val = self._edit_value_for_original(item)
+            chosen_val = self._edit_value_for_chosen(item, chosen)
+            if chosen_val != original_val:
+                edit_modifications.append(f"Replace {original_val} with {chosen_val}.")
+        image_prompt_edit = self._build_edit_prompt(target_product, edit_modifications)
 
         # R4：可定制项--有 AI 走 AI 分析判断，无 AI 走规则卡兜底
         customization_slots = await self._get_customization_slots_with_ai_fallback(rule_card)
@@ -487,6 +603,7 @@ class PromptGenerator:
             "structured_prompt_cn": structured_prompt_cn,
             "image_prompt_positive": image_prompt_positive,
             "image_prompt_negative": image_prompt_negative,
+            "image_prompt_edit": image_prompt_edit,
             "change_summary": change_summary,
             # R4：可定制项列表，前端展示为可选 checkbox，勾选后拼入生图提示词
             "customization_slots": customization_slots,
@@ -1005,9 +1122,17 @@ class PromptGenerator:
         changes: dict,
         recommended: dict,
         adaptation: dict,
+        target_product: str,
         library_recommendations: Optional[List[dict]] = None,
     ) -> tuple:
         """组装英文生图提示词（正向 + 负向）
+
+        #4：正向提示词按语义分段（Composition/Style/MUST include/Personalization/
+        Requirements），换行分隔，而非过去逗号拼一整行——分段结构对模型更易解析重点，
+        且顺带修复两个信息点：target_product 之前从未进入过英文提示词；
+        must_have_elements 的 position（元素该放画面哪个位置）之前被读入又被丢弃未使用。
+        信息来源、_append_english 防中文泄漏机制、负向提示词逻辑均不变，只改这一层的
+        输出格式。
 
         参数:
             rule_card: 完整规则卡字典（供 _get_pod_hints 提取真实定制文案）
@@ -1017,12 +1142,18 @@ class PromptGenerator:
             changes: 替换方案
             recommended: AI 推荐结果（含 style_description 等辅助描述）
             adaptation: 产品适配规则
+            target_product: 目标产品类型（如 "毛毯"、"T恤"），进 Composition 段开头
             library_recommendations: 可选，自有图库推荐的参考图列表
 
         返回:
             (positive_prompt, negative_prompt) 二元组
         """
-        positive_parts = []
+        # ---- 分段收集：每段各自独立的 parts 列表，最后各自 join 再用换行拼接 ----
+        composition_parts = []  # type: List[str]
+        style_parts = []        # type: List[str]
+        must_include = []       # type: List[str]  # "元素描述 (位置)" 或纯描述
+        personalization_line = ""  # type: str
+        requirements_parts = []  # type: List[str]
 
         # 1. 从第2层取构图描述和风格
         style = layer_2.get("style", "")
@@ -1040,20 +1171,42 @@ class PromptGenerator:
         color_en = ai_color if ai_color else self._extract_english(color_mood)
         layout_en = layer_2.get("layout_formula_en") or ai_layout or layout
 
-        # 2. 构图和风格（#1：含中文片段用 _append_english 兜底丢弃，避免中文进英文提示词）
-        self._append_english(positive_parts, layout_en, "layout_formula")
-        self._append_english(positive_parts, style_en, "style")
+        # 2. Composition 段：构图 + 核心卖点（核心卖点是"为什么这样设计"的意图说明，
+        # 归在构图段末尾比单独成段更连贯）
+        self._append_english(composition_parts, layout_en, "layout_formula")
+        core = layer_0.get("core_selling_point", "")
+        core_en = layer_0.get("core_selling_point_en") or self._extract_english(core)
+        self._append_english(composition_parts, core_en, "core_selling_point")
+
+        # 3. Style 段：风格 + 色彩 + 图库参考风格/元素
+        self._append_english(style_parts, style_en, "style")
         if color_en and not self._contains_cjk(color_en):
-            positive_parts.append(f"{color_en} color palette")
+            style_parts.append(f"{color_en} color palette")
         elif color_en:
             logging.warning("#1: color_mood 含中文，丢弃: %s", color_en[:50])
 
-        # 3. 核心卖点描述（#1b：优先 core_selling_point_en，缺失回退 _extract_english）
-        core = layer_0.get("core_selling_point", "")
-        core_en = layer_0.get("core_selling_point_en") or self._extract_english(core)
-        self._append_english(positive_parts, core_en, "core_selling_point")
+        if library_recommendations:
+            ref_elements = []
+            for ref in library_recommendations:
+                # 提取参考图的风格英文部分（#1：图库打标是中文，_extract_english 对无 / 的中文原样返回，CJK 丢弃）
+                for s in ref.get("styles", []):
+                    s_en = self._extract_english(s)
+                    if s_en and not self._contains_cjk(s_en) and s_en not in ref_elements:
+                        ref_elements.append(s_en)
+                    elif s_en and self._contains_cjk(s_en):
+                        logging.warning("#1: ref style 含中文，丢弃: %s", s_en[:50])
+                # 提取参考图的关键元素
+                for elem in ref.get("elements", []):
+                    e_en = self._extract_english(elem)
+                    if e_en and not self._contains_cjk(e_en) and e_en not in ref_elements:
+                        ref_elements.append(e_en)
+                    elif e_en and self._contains_cjk(e_en):
+                        logging.warning("#1: ref element 含中文，丢弃: %s", e_en[:50])
+            if ref_elements:
+                style_parts.append("reference style: " + ", ".join(ref_elements[:5]))
 
-        # 4. 从选中的替换方案取具体元素描述
+        # 4. MUST include 元素清单：从选中的替换方案取具体元素描述（不带 position——
+        # ReplaceableItem 模型本身没有这个字段，只有 MustHaveElement 有）
         replaceable = layer_3.get("replaceable_elements", {})
         for field_name, item in replaceable.items():
             # #15：跳过文字槽位--其文案由 _get_pod_hints 统一处理（经 _sanitize 成英文），
@@ -1077,9 +1230,11 @@ class PromptGenerator:
                         idx = alts.index(chosen)
                         if idx < len(alts_en):
                             chosen_en = alts_en[idx]
-            self._append_english(positive_parts, chosen_en, f"replaceable.{field_name}")
+            temp = []  # type: List[str]
+            self._append_english(temp, chosen_en, f"replaceable.{field_name}")
+            must_include.extend(temp)
 
-        # 5. 必备元素
+        # 5. MUST include 元素清单：必备元素（#4：新增 position，之前读入未使用）
         must_have = layer_2.get("must_have_elements", [])
         for elem in must_have:
             # #15：跳过文字槽位--其文案由 _get_pod_hints 统一处理（经 _sanitize 成英文），
@@ -1088,46 +1243,54 @@ class PromptGenerator:
                 continue
             desc = elem.get("description", "")
             desc_en = elem.get("description_en") or self._extract_english(desc)
-            self._append_english(positive_parts, desc_en, "must_have.description")
+            temp = []  # type: List[str]
+            self._append_english(temp, desc_en, "must_have.description")
+            # position 字段模型上是纯中文（无 _en 平行字段，见 models/rule_card.py），
+            # 不能假设它是英文——_extract_english 对词表格式"中文/English"能取到英文，
+            # 纯中文（VLM 直接输出"中心偏上"这类值）无 / 会原样返回，必须再过 CJK 检测丢弃，
+            # 否则英文提示词会混入中文（违反 R1 图无中文约束）
+            position_raw = elem.get("position", "") if isinstance(elem, dict) else ""
+            position_en = self._extract_english(position_raw)
+            if position_en and self._contains_cjk(position_en):
+                logging.warning("#1: must_have.position 含中文，丢弃: %s", position_en[:30])
+                position_en = ""
+            for d in temp:
+                must_include.append(f"{d} ({position_en})" if position_en else d)
 
-        # 6. 产品适配：画布比例
-        canvas_ratio = adaptation.get("canvas_ratio", "")
-        if canvas_ratio:
-            positive_parts.append(f"aspect ratio {canvas_ratio}")
+        # #6：不再拼 canvas_ratio 到英文提示词（原因同 _build_image_prompts 处注释：
+        # 规则卡画布比例可能与用户实选生图尺寸矛盾，以实选为准，比例约束改由
+        # image_gen.py submit 时前置）
 
-        # 7. 自有图库参考：加入参考图的风格和元素描述
-        if library_recommendations:
-            ref_elements = []
-            for ref in library_recommendations:
-                # 提取参考图的风格英文部分（#1：图库打标是中文，_extract_english 对无 / 的中文原样返回，CJK 丢弃）
-                for s in ref.get("styles", []):
-                    s_en = self._extract_english(s)
-                    if s_en and not self._contains_cjk(s_en) and s_en not in ref_elements:
-                        ref_elements.append(s_en)
-                    elif s_en and self._contains_cjk(s_en):
-                        logging.warning("#1: ref style 含中文，丢弃: %s", s_en[:50])
-                # 提取参考图的关键元素
-                for elem in ref.get("elements", []):
-                    e_en = self._extract_english(elem)
-                    if e_en and not self._contains_cjk(e_en) and e_en not in ref_elements:
-                        ref_elements.append(e_en)
-                    elif e_en and self._contains_cjk(e_en):
-                        logging.warning("#1: ref element 含中文，丢弃: %s", e_en[:50])
-            if ref_elements:
-                positive_parts.append("reference style: " + ", ".join(ref_elements[:5]))
+        # 6. Personalization 段：POD 定制要素——从规则卡提取竞品图上的实际文案作示例。
+        # _get_pod_hints 返回 [文字定制句, "clean printable design", "high resolution..."]，
+        # 前者归 Personalization，后两条质量要求归 Requirements（不再和其他质量词混在一起）
+        pod_customization_hints = self._get_pod_hints(rule_card)
+        if pod_customization_hints:
+            personalization_line = pod_customization_hints[0]
+            requirements_parts.extend(pod_customization_hints[1:])
 
-        # 8. 通用质量词
+        # 7. Requirements 段：通用质量词
         # R1：正向引导"只画英文文字"——比负向排除更可靠。OpenAI 模式下负向会被
         # 合并进正向（Do not include: ...），对弱模型有"粉红大象"效应，正向引导是主保障。
-        positive_parts.extend(["high quality", "detailed", "professional design", "english text only"])
+        requirements_parts.extend(["english text only", "high quality", "detailed", "professional design"])
 
-        # 9. POD 定制要素——从规则卡提取竞品图上的实际文案作示例
-        pod_customization_hints = self._get_pod_hints(rule_card)
-        positive_parts.extend(pod_customization_hints)
+        # ---- 组装分段模板 ----
+        product_en = self._extract_product_name_en(target_product)
+        lines = [f"Create a {product_en} print-on-demand design."]
+        if composition_parts:
+            lines.append("Composition: " + ", ".join(composition_parts) + ".")
+        if style_parts:
+            lines.append("Style: " + ", ".join(style_parts) + ".")
+        if must_include:
+            lines.append("The design MUST include: " + "; ".join(must_include) + ".")
+        if personalization_line:
+            lines.append("Personalization: " + personalization_line + ".")
+        if requirements_parts:
+            lines.append("Requirements: " + ", ".join(requirements_parts) + ".")
 
-        positive_prompt = ", ".join(positive_parts)
+        positive_prompt = "\n".join(lines)
 
-        # ---- 负向提示词 ----
+        # ---- 负向提示词（不变） ----
         negative_parts = list(COMMON_NEGATIVE_PROMPTS)
 
         # 从 must_not_change 推导排除项
@@ -1214,6 +1377,24 @@ class PromptGenerator:
                 return True
         return False
 
+    def _extract_product_name_en(self, target_product: str) -> str:
+        """#4：从 target_product 提取英文产品名，供英文提示词首句使用。
+
+        target_product 的真实格式是空格分隔的"英文名 中文名"（如 "T-Shirt T恤"、
+        "Mug 马克杯"），不是词表的"中文/English"斜杠格式，_extract_english 处理
+        不了（无 / 会原样返回整串，导致英文提示词里混入中文）。按空格切分后只保留
+        不含 CJK 的词——这些产品名英文部分本身不含空格，多词英文名（如未来可能出现
+        "Beach Towel"）会被这个简单分词拆开，属已知局限，全部找不到时兜底返回原值
+        （极端情况总比空字符串强，宁可保留可能含中文的产品名也不让提示词第一句缺失产品类型）。
+        """
+        if not target_product:
+            return ""
+        candidates = [w for w in target_product.split() if w and not self._contains_cjk(w)]
+        if candidates:
+            return " ".join(candidates)
+        logging.warning("#4: target_product 提取不到英文部分，原样使用: %s", target_product[:30])
+        return target_product
+
     def _append_english(self, parts: list, text: str, field_name: str,
                         allow_cjk_fallback: bool = False) -> None:
         """#1：拼接英文片段到正向提示词，堵中文泄漏。
@@ -1236,6 +1417,82 @@ class PromptGenerator:
                 logging.warning("#1: 字段 %s 含中文，丢弃不入英文提示词: %s", field_name, text[:50])
         else:
             parts.append(text)
+
+    # ==================== 编辑指令式提示词（image_prompt_edit）====================
+    # 配合竞品原图一起发给生图 API 的 /v1/images/edits 接口：Spike 验证过带图 + 编辑
+    # 指令（只说"改哪里"，不重新描述整个设计）比纯文本"完整描述"式提示词更精确、更短。
+    # 与 image_prompt_positive 并存，两者互不影响，供后续"附带竞品原图生图"功能选用。
+
+    def _edit_lang_value(self, raw: str, en: Optional[str] = None) -> str:
+        """编辑指令提示词的取值策略：优先英文，取不到则放行原始值（可能含中文）。
+
+        与 _append_english 的策略刚好相反——编辑指令提示词会连同竞品原图一起发给
+        生图模型，模型能"看到"图内容，中文值在这里只是用来定位"图里的哪个东西"，
+        不是要求模型画出中文字，因此不丢弃、不报 warning，也不做 NAME/2026 占位替换。
+        """
+        if en and not self._contains_cjk(en):
+            return en
+        extracted = self._extract_english(raw)
+        if extracted and not self._contains_cjk(extracted):
+            return extracted
+        return raw
+
+    def _edit_value_for_original(self, item) -> str:
+        """取可替换维度 original 的编辑指令用值（语言策略见 _edit_lang_value）。"""
+        if not isinstance(item, dict):
+            return self._edit_lang_value(str(item or ""))
+        return self._edit_lang_value(item.get("original", ""), item.get("original_en"))
+
+    def _edit_value_for_chosen(self, item, chosen: str) -> str:
+        """取可替换维度 chosen（替换后的值）的编辑指令用值。
+
+        chosen 等于 original 时复用 original_en；不等时尝试 alternatives_en 索引映射
+        （与 _build_image_prompts 的 chosen_en 推导逻辑一致），取不到再走通用兜底。
+        """
+        if not isinstance(item, dict):
+            return self._edit_lang_value(chosen)
+        original = item.get("original", "")
+        if chosen == original:
+            return self._edit_lang_value(original, item.get("original_en"))
+        alts = item.get("alternatives", [])
+        alts_en = item.get("alternatives_en") or []
+        if alts_en and chosen in alts:
+            idx = alts.index(chosen)
+            if idx < len(alts_en):
+                return self._edit_lang_value(chosen, alts_en[idx])
+        return self._edit_lang_value(chosen)
+
+    def _build_edit_prompt(self, target_product: str, modifications: List[str], requirements_note: str = "") -> str:
+        """组装"编辑指令"式生图提示词。
+
+        假设生图 API 会拿到竞品原图作为输入，只需说明"在这张图基础上做哪些修改"，
+        其余保持不变，不必像 image_prompt_positive 那样从头描述整个设计。
+
+        参数:
+            target_product: 目标产品类型（如 "毛毯"、"T恤"）
+            modifications: 修改指令列表，每项已是完整的一条指令（如
+                           "Replace Dachshund with French Bulldog."）；为空列表时
+                           用"无元素改动，忠实还原原图"的兜底句
+            requirements_note: 预留参数，供后续批次插入额外定制项文本，本次不使用
+        """
+        lines = [
+            f"Using the attached image as the base design, recreate it as a {target_product} "
+            "print design with ONLY these modifications:"
+        ]
+        if modifications:
+            for i, mod in enumerate(modifications, 1):
+                lines.append(f"{i}. {mod}")
+        else:
+            lines.append("1. No element changes; faithfully recreate the base design.")
+        lines.append(
+            "Keep everything else — composition, style, layout and all other elements — "
+            "identical to the reference image."
+        )
+        lines.append(
+            "Requirements: all visible text in the image must be English only; "
+            "each text appears exactly once; clean printable design."
+        )
+        return "\n".join(lines)
 
     def _sanitize_text_slot_value(self, dim_name: str, original: str) -> str:
         """R1：确保文字槽位的示例文案不含中文，避免正向写中文与负向排除中文矛盾。

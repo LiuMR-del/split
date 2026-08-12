@@ -130,6 +130,8 @@ export default function PromptVersionB({ ruleId, ruleCard }: PromptVersionBProps
           ruleId={ruleId}
           ruleName={ruleCard?.rule_name}
           version="B"
+          hasRuleImage={Boolean(ruleCard?.source_images?.length)}
+          ruleImageUrl={ruleCard?.thumbnail_path || ''}
         />
       )}
     </div>
