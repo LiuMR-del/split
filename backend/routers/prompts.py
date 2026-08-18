@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from services.rule_store import get_rule
-from services.prompt_generator import PromptGenerator, extract_element_list
+from services.prompt_generator import PromptGenerator, extract_element_list, translate_element_labels
 from services.ai_client import load_ai_client_from_config
 from services.image_library_store import get_image
 
@@ -244,9 +244,10 @@ def _apply_orientation(width: int, height: int, orientation: Optional[str]):
 async def get_extractable_elements(rule_id: str):
     """元素拆分图：返回该规则卡可拆分的元素清单 + 每个元素的抠取指令（三期阶段四）。
 
-    纯同步计算（不调 AI、不调生图），只读规则卡做结构化提取与去重。
-    `supports_reference` 与"有没有竞品原图"由前端自行判断（前者查 GET /api/gen/config，
-    后者看 ruleCard.source_images），这里不重复返回。
+    结构化提取与去重是纯同步计算（不调生图）；2026-08-18 起**候选名无中文时会
+    发起一次 AI 批量翻译**（见下方 translate_element_labels 调用处注释），
+    正常中文卡仍是零 AI 调用。`supports_reference` 与"有没有竞品原图"由前端自行
+    判断（前者查 GET /api/gen/config，后者看 ruleCard.source_images），这里不重复返回。
     """
     rule = get_rule(rule_id)
     if rule is None:
@@ -257,6 +258,13 @@ async def get_extractable_elements(rule_id: str):
     except Exception as e:
         logging.exception("提取可拆分元素清单失败 rule_id=%s", rule_id)
         raise HTTPException(status_code=500, detail=f"提取元素清单失败：{str(e)}")
+
+    # 2026-08-18（用户反馈"英文附带中文"）：候选名没有中文时批量翻译附注。
+    # 正常新卡的候选名就是中文（prompt 已钉死语言），不触发；只有语言漂移的卡
+    # （中英字段全英文，如 RULE-0070）才会发起**一次** AI 批量翻译调用。
+    # 本端点原"纯同步不调 AI"的契约由此放宽为"必要时一次翻译调用"，
+    # 无 AI 配置/翻译失败静默跳过，接口本身永不因翻译不可用。
+    await translate_element_labels(elements, load_ai_client_from_config())
 
     # 2026-08-17：连带返回竞品原图的实际宽高，供前端提交生图时按**原图比例**请求画布。
     # 抠取要求"保持原图位置与比例"，如果还按固定 1024×1024 方图请求，竖版竞品图会被

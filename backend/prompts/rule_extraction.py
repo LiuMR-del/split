@@ -155,9 +155,9 @@ def get_rule_extraction_prompt() -> str:
   不要把某个具体物件的名字（某个角色、某个场景道具、某种装饰图案）直接写进 must_not_change——
   如果一个元素具体到"是什么"，它就该在 replaceable_elements 里，而不是 must_not_change 里。
 - **replaceable_elements**：可替换元素字典，key 为元素名。**key 必须是简短的中文维度名**（如"宠物品种"、"边框花卉风格"、"爪印图标"），不要用英文、拼音或 snake_case——这个名字会直接显示在界面上，且系统按中文名做跨层去重，value 包含：
-  - original：原始值
+  - original：原始值。**必须用中文描述**（如"垒球"、"金毛犬"、"马尾辫背面击球姿势"），不要写英文——中文版直接显示在界面上，英文只写进 original_en。唯一例外：is_text_slot=true 的文字槽位，original 保留图上的原文（名字、年份、英文标语照抄，不翻译）
   - original_en：原始值的英文版本（用英文描述，不要中文）
-  - alternatives：可替换的选项列表（给出 3-5 个建议）
+  - alternatives：可替换的选项列表（给出 3-5 个建议）。**同样必须用中文**（如"棒球"、"排球"），英文只写进 alternatives_en
   - alternatives_en：可替换选项的英文版本列表（与 alternatives 一一对应，用英文描述，不要中文）
   - is_text_slot：是否为文字类槽位（true/false），判断标准同上
 - **must_not_change**：绝对不能替换的抽象构图/风格规则列表（不是具体物件清单）

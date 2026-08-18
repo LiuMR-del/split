@@ -34,6 +34,8 @@ import { getSupportsReference } from '@/lib/genConfig';
 interface VariantFromApi {
   variant_key: string;
   label_cn: string;
+  /* 候选名无中文时后端批量翻译的中文附注（2026-08-18，语言漂移卡兜底），可能缺失 */
+  label_translated?: string;
   label_for_prompt: string;
   is_original: boolean;
   prompt: string;
@@ -60,6 +62,8 @@ interface JobItem {
   elementName: string;
   /** 变体信息 */
   labelCn: string;
+  /** 英文候选名的中文附注（无则不显示） */
+  labelTranslated?: string;
   isOriginal: boolean;
   prompt: string;
   /* 本地状态 */
@@ -171,6 +175,7 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
             elementKey: el.element_key,
             elementName: el.name_cn,
             labelCn: v.label_cn,
+            labelTranslated: v.label_translated,
             isOriginal: v.is_original,
             prompt: v.prompt,
             checked: false,
@@ -516,6 +521,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="text-xs font-mono text-codex-text truncate">
                                   {job.labelCn}
+                                  {job.labelTranslated && (
+                                    <span className="text-codex-text-secondary">
+                                      {`（${job.labelTranslated}）`}
+                                    </span>
+                                  )}
                                 </span>
                                 {job.isOriginal && (
                                   <span className="px-1 py-0.5 text-[10px] font-mono rounded bg-codex-border/50 text-codex-text-secondary">
@@ -630,8 +640,12 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                                   onChange={() => toggleDownloadChecked(job.key)}
                                   className="cursor-pointer accent-codex-accent"
                                 />
-                                <span className="text-[11px] font-mono text-codex-text truncate" title={job.labelCn}>
+                                <span
+                                  className="text-[11px] font-mono text-codex-text truncate"
+                                  title={job.labelTranslated ? `${job.labelCn}（${job.labelTranslated}）` : job.labelCn}
+                                >
                                   {job.labelCn}
+                                  {job.labelTranslated ? `（${job.labelTranslated}）` : ''}
                                 </span>
                               </label>
                               <button

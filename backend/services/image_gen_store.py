@@ -183,6 +183,47 @@ def update_task(task_id: str, updates: dict) -> bool:
     return True
 
 
+def _row_to_task(row) -> dict:
+    """SQLite 行 → 任务字典。list_tasks 与 list_tasks_by_rule_group 共用
+    （2026-08-18 抽出，此前 list_tasks 内联一份，新增分组分页时避免再抄一遍）。"""
+    return {
+        "task_id": row["task_id"],
+        "out_task_id": row["out_task_id"],
+        "rule_id": row["rule_id"],
+        "rule_name": row["rule_name"] or "",
+        "version": row["version"] or "",
+        "status": row["status"],
+        "prompt_positive": row["prompt_positive"],
+        "prompt_negative": row["prompt_negative"],
+        "width": row["width"],
+        "height": row["height"],
+        "image_urls": json.loads(row["image_urls"]),
+        "local_images": json.loads(row["local_images"]),
+        "error": row["error"],
+        "estimated_credits": row["estimated_credits"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+        "used_reference": bool(row["used_reference"]),
+    }
+
+
+def count_tasks_by_rule() -> dict:
+    """按规则分组统计任务真实总条数（2026-08-18 用户反馈）。
+
+    列表接口是分页的（一页 20 条），前端分组徽标若按"已加载的任务"计数，
+    加载更多之前会少算（垒球组实际 24 条只显示 20）。这里直接从 SQLite 聚合，
+    给出每个 rule_id 的**全量**条数，与分页无关。
+
+    返回: {rule_id: count}（rule_id 为空的归入 ""）
+    """
+    conn = _get_connection()
+    rows = conn.execute(
+        "SELECT COALESCE(rule_id, '') AS rid, COUNT(*) AS cnt FROM image_gen_tasks GROUP BY rid"
+    ).fetchall()
+    conn.close()
+    return {row["rid"]: row["cnt"] for row in rows}
+
+
 def list_tasks(
     rule_id: Optional[str] = None,
     status: Optional[str] = None,
@@ -238,34 +279,135 @@ def list_tasks(
     rows = conn.execute(query_sql, query_params).fetchall()
     conn.close()
 
-    # 组装结果
-    items = []
-    for row in rows:
-        items.append({
-            "task_id": row["task_id"],
-            "out_task_id": row["out_task_id"],
-            "rule_id": row["rule_id"],
-            "rule_name": row["rule_name"] or "",
-            "version": row["version"] or "",
-            "status": row["status"],
-            "prompt_positive": row["prompt_positive"],
-            "prompt_negative": row["prompt_negative"],
-            "width": row["width"],
-            "height": row["height"],
-            "image_urls": json.loads(row["image_urls"]),
-            "local_images": json.loads(row["local_images"]),
-            "error": row["error"],
-            "estimated_credits": row["estimated_credits"],
-            "created_at": row["created_at"],
-            "completed_at": row["completed_at"],
-            "used_reference": bool(row["used_reference"]),
-        })
+    # 组装结果（行转字典统一走 _row_to_task，与 list_tasks_by_rule_group 共用）
+    items = [_row_to_task(row) for row in rows]
 
     total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
 
     return {
         "items": items,
         "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
+def find_task_ids_by_rule(rule_id: str) -> List[str]:
+    """列出某规则下的全部任务 ID（按组清理用，2026-08-18 用户反馈）。
+
+    只查询不删除——删除由路由串行复用 `delete_task`（删除逻辑单一事实来源）。
+    `rule_id` 传空字符串时查"未关联规则"那一组（COALESCE 后为空的记录）。
+    """
+    conn = _get_connection()
+    rows = conn.execute(
+        "SELECT task_id FROM image_gen_tasks WHERE COALESCE(rule_id, '') = ? ORDER BY created_at DESC",
+        (rule_id or "",),
+    ).fetchall()
+    conn.close()
+    return [row["task_id"] for row in rows]
+
+
+def find_orphan_task_ids() -> List[str]:
+    """找出"所属规则卡已被删除"的孤儿任务 ID（2026-08-18 用户反馈：缺废弃数据清理）。
+
+    规则卡删除时不会级联删它的生图任务（历史设计），久了会攒下一堆点进去
+    404、还白占磁盘的记录（实测 640MB 里有 55 条属于 9 个已删规则卡）。
+    这里只**识别**不删除，删除由调用方显式触发（数据删除必须用户确认）。
+
+    rule_id 为空的任务**不算孤儿**——那是早期版本或手动提交的数据，
+    没有归属可判定，宁可保留也不误删。
+    """
+    from services.rule_store import get_rule
+
+    conn = _get_connection()
+    rows = conn.execute(
+        "SELECT task_id, COALESCE(rule_id, '') AS rid FROM image_gen_tasks"
+    ).fetchall()
+    conn.close()
+
+    alive = {}  # rule_id -> bool 缓存，避免同一规则重复查磁盘
+    orphans = []
+    for row in rows:
+        rid = row["rid"]
+        if not rid:
+            continue
+        if rid not in alive:
+            alive[rid] = get_rule(rid) is not None
+        if not alive[rid]:
+            orphans.append(row["task_id"])
+    return orphans
+
+
+def list_tasks_by_rule_group(page: int = 1, page_size: int = 10, status: Optional[str] = None) -> dict:
+    """**按规则分组**分页返回任务（2026-08-18 用户反馈重做分页单位）。
+
+    此前 `list_tasks` 的分页单位是"任务"，20 条任务常常被 2 个大组吃满
+    （元素变体一次就 20+ 条），点一次"加载更多"只多冒出 1 个规则组，
+    看起来像一条条往外挤、很难用。改为**以规则组为分页单位**：
+    先按"组内最新任务时间"倒序取本页的 N 个 rule_id，再把这些组的任务
+    **全部**取回，前端一次就能完整展开一个组。
+
+    参数:
+        page: 页码（从 1 开始）
+        page_size: 每页**组数**（不是任务数）
+        status: 可选状态筛选，作用于组内任务；筛完为空的组不返回
+
+    返回:
+        {items: 任务列表（含本页各组全部任务）, total_groups, page, page_size, total_pages}
+    """
+    conn = _get_connection()
+
+    where = ""
+    params = []  # type: List
+    if status:
+        where = "WHERE status = ?"
+        params.append(status)
+
+    # 1) 组维度：按组内最新任务时间倒序，分页取 rule_id
+    group_sql = f"""
+        SELECT COALESCE(rule_id, '') AS rid, MAX(created_at) AS latest
+        FROM image_gen_tasks
+        {where}
+        GROUP BY rid
+        ORDER BY latest DESC
+        LIMIT ? OFFSET ?
+    """
+    offset = (page - 1) * page_size
+    group_rows = conn.execute(group_sql, params + [page_size, offset]).fetchall()
+    rids = [r["rid"] for r in group_rows]
+
+    total_groups = conn.execute(
+        f"SELECT COUNT(*) AS c FROM (SELECT COALESCE(rule_id,'') AS rid FROM image_gen_tasks {where} GROUP BY rid)",
+        params,
+    ).fetchone()["c"]
+
+    items = []
+    if rids:
+        # 2) 取这些组的**全部**任务（组内不分页，保证前端能完整展开）
+        placeholders = ",".join("?" for _ in rids)
+        task_where = f"WHERE COALESCE(rule_id, '') IN ({placeholders})"
+        task_params = list(rids)
+        if status:
+            task_where += " AND status = ?"
+            task_params.append(status)
+        task_sql = f"""
+            SELECT task_id, out_task_id, rule_id, rule_name, version, status,
+                   prompt_positive, prompt_negative, width, height,
+                   image_urls, local_images, error, estimated_credits,
+                   created_at, completed_at, used_reference
+            FROM image_gen_tasks
+            {task_where}
+            ORDER BY created_at DESC
+        """
+        rows = conn.execute(task_sql, task_params).fetchall()
+        items = [_row_to_task(row) for row in rows]
+
+    conn.close()
+    total_pages = (total_groups + page_size - 1) // page_size if page_size else 1
+    return {
+        "items": items,
+        "total_groups": total_groups,
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,

@@ -1951,6 +1951,66 @@ def _is_semantic_duplicate(candidate: str, existing: List[str], threshold: float
     return False
 
 
+async def translate_element_labels(elements: List[dict], ai_client) -> None:
+    """给元素变体清单里"没有中文"的候选名就地补 `label_translated`（2026-08-18 用户反馈）。
+
+    正常情况下候选名（label_cn = 规则卡的 original/alternatives）就是中文，
+    prompt 已钉死语言，走不到翻译。但上游代理会路由到不同后端模型，实测出现过
+    整卡中英字段**全填英文**的漂移（RULE-0070：`original='softball'`、
+    `original_en='softball'`，中文在源头就缺失）——这类卡界面只能显示英文，
+    用户要求"英文附带中文"。
+
+    做法与版本C 下拉框的 `_translate_english_options` 同款：收集不含 CJK 的
+    候选名去重，一次 AI 调用批量翻译（`get_option_translation_prompt`），
+    结果写进每个 variant 的 `label_translated`（只供前端小字显示，不进生图
+    提示词）。无 AI 客户端 / 调用失败 / 数量对不上时静默跳过——翻译是锦上添花，
+    绝不能让元素清单接口因此不可用。
+    """
+    if not ai_client or not elements:
+        return
+
+    import re as _re
+
+    def _has_cjk(s: str) -> bool:
+        return bool(_re.search(r"[一-鿿]", s or ""))
+
+    terms = []  # type: List[str]
+    seen = set()
+    for el in elements:
+        for v in el.get("variants", []):
+            label = (v.get("label_cn") or "").strip()
+            # 已含中文的不翻；纯数字/符号（无字母）翻译无意义
+            if not label or _has_cjk(label) or not any(c.isalpha() for c in label):
+                continue
+            if label not in seen:
+                seen.add(label)
+                terms.append(label)
+    if not terms:
+        return
+
+    system_prompt = get_option_translation_prompt(json.dumps(terms, ensure_ascii=False))
+    try:
+        resp = await ai_client.text_request(
+            system_prompt, "请严格按 JSON 格式输出翻译结果。", temperature=0
+        )
+        result = extract_json_from_ai_response(resp)
+    except Exception:
+        logging.warning("元素变体候选翻译失败，跳过（界面只显示英文原文）", exc_info=True)
+        return
+    translations = (result or {}).get("translations") or []
+    if len(translations) != len(terms):
+        logging.warning(
+            "元素变体候选翻译数量不符（请求 %d 返回 %d），跳过", len(terms), len(translations)
+        )
+        return
+    mapping = dict(zip(terms, translations))
+    for el in elements:
+        for v in el.get("variants", []):
+            cn = mapping.get((v.get("label_cn") or "").strip())
+            if cn and isinstance(cn, str):
+                v["label_translated"] = cn
+
+
 def extract_element_list(rule_card: dict) -> List[dict]:
     """从规则卡提取"可拆分元素"清单（三期阶段四）。
 

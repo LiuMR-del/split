@@ -12,7 +12,7 @@ import Card from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import Badge from '@/components/ui/Badge';
 import Link from 'next/link';
-import { apiGet, apiDelete, unwrapData } from '@/lib/api';
+import { apiGet, apiPost, apiDelete, unwrapData } from '@/lib/api';
 
 /* 生图任务数据结构 */
 interface GenTask {
@@ -62,6 +62,10 @@ const VERSION_TABS: Record<string, { label: string; short: string }> = {
 /* Tab 显示顺序 */
 const VERSION_ORDER = ['A', 'B', 'C', 'E', UNVERSIONED];
 
+/* 每页加载多少个**规则组**（不是任务数）。组内任务全量返回，所以一次能完整展开。
+ * 10 组通常覆盖近期全部工作量；再往前的历史点"加载更多规则"。 */
+const GROUPS_PER_PAGE = 10;
+
 /* 按规则分组后的结构 */
 interface RuleGroup {
   ruleId: string;
@@ -77,6 +81,23 @@ interface RuleGroup {
 export default function GenPage() {
   /* 任务列表（未分组的原始扁平数据） */
   const [tasks, setTasks] = useState<GenTask[]>([]);
+  /* 后端规则组总数。⚠️ 分页单位是**规则组**不是任务——按任务分页时一次元素变体
+   * 生成（20+ 条）就吃满一页，点"加载更多"只多冒出一个组，很难用
+   * （2026-08-18 用户反馈）。记录本身从不自动清理，废弃数据用"清理"按钮显式删 */
+  const [totalGroups, setTotalGroups] = useState(0);
+  /* 孤儿任务数（所属规则卡已删），>0 时显示清理入口 */
+  const [orphanCount, setOrphanCount] = useState(0);
+  const [cleaning, setCleaning] = useState(false);
+  /* 正在按组删除的 ruleId（按钮态，防重复点击） */
+  const [deletingGroupId, setDeletingGroupId] = useState<string | null>(null);
+  /* 已加载到第几页 */
+  const [page, setPage] = useState(1);
+  /* 每个规则分组的**真实**任务总数（后端 SQLite 聚合，与分页无关）。
+   * 分组徽标"N 条"必须用它——按已加载任务计数会在"加载更多"之前少算
+   * （2026-08-18 用户反馈：垒球组实际 24 条只显示 20） */
+  const [groupCounts, setGroupCounts] = useState<Record<string, number>>({});
+  /* "加载更多"进行中（与首屏 loading 分开，避免整页骨架闪烁） */
+  const [loadingMore, setLoadingMore] = useState(false);
   /* 加载状态 */
   const [loading, setLoading] = useState(true);
   /* 加载错误 */
@@ -92,13 +113,17 @@ export default function GenPage() {
   /* 大图预览 URL */
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  /* 加载任务列表 */
-  const loadTasks = useCallback(async () => {
-    setLoading(true);
+  /* 加载任务列表。pageArg>1 时为"加载更多"（追加），否则重载第一页（刷新/首屏） */
+  const loadTasks = useCallback(async (pageArg: number = 1) => {
+    const append = pageArg > 1;
+    if (append) setLoadingMore(true);
+    else setLoading(true);
     setLoadError('');
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const res = await apiGet<any>('/api/gen/tasks');
+      const res = await apiGet<any>(
+        `/api/gen/tasks?group_by_rule=true&page=${pageArg}&page_size=${GROUPS_PER_PAGE}`
+      );
       const data = unwrapData<any>(res);
       // 后端返回 {items: [...]} 或 {tasks: [...]} 或直接数组（裸数据，unwrapData 原样透传）
       const list = data.items || data.tasks || (Array.isArray(data) ? data : []);
@@ -107,12 +132,34 @@ export default function GenPage() {
         ...t,
         images: t.images || (t.image_urls || []).map((u: string) => ({ url: u })),
       }));
-      setTasks(normalized);
+      setTasks((prev) => (append ? [...prev, ...normalized] : normalized));
+      setPage(pageArg);
+      setTotalGroups(typeof data.total_groups === 'number' ? data.total_groups : 0);
+      /* 首页/刷新时同步拉分组真实计数（加载更多不用重拉，计数与分页无关）。
+       * 失败静默——徽标回落到"已加载条数"，不阻断列表 */
+      if (!append) {
+        try {
+          const cres = await apiGet<{ counts?: Record<string, number> }>(
+            '/api/gen/tasks/group-counts'
+          );
+          const counts = unwrapData<{ counts?: Record<string, number> }>(cres)?.counts;
+          if (counts && typeof counts === 'object') setGroupCounts(counts);
+        } catch {
+          /* 静默 */
+        }
+        try {
+          const ores = await apiGet<{ count?: number }>('/api/gen/tasks/orphans');
+          setOrphanCount(unwrapData<{ count?: number }>(ores)?.count || 0);
+        } catch {
+          /* 静默 */
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '加载任务列表失败';
       setLoadError(msg);
     } finally {
       setLoading(false);
+      setLoadingMore(false);
     }
   }, []);
 
@@ -153,9 +200,79 @@ export default function GenPage() {
       await apiDelete(`/api/gen/task/${taskId}`);
       /* 从列表中移除，不刷新整个页面 */
       setTasks((prev) => prev.filter((t) => t.task_id !== taskId));
+      /* 分组真实计数同步减一（找到该任务所属规则） */
+      const deleted = tasks.find((t) => t.task_id === taskId);
+      const rid = deleted?.rule_id || '';
+      if (rid) {
+        setGroupCounts((prev) =>
+          prev[rid] ? { ...prev, [rid]: Math.max(0, prev[rid] - 1) } : prev
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '删除失败';
       alert('删除失败: ' + msg);
+    }
+  };
+
+  /* 按组删除：一次删掉该规则下的全部生图记录（2026-08-18 用户反馈）。
+   * 元素变体一组常有 20+ 条，逐条删要点几十次确认。 */
+  const handleDeleteGroup = async (group: RuleGroup) => {
+    const count = groupCounts[group.ruleId] ?? group.total;
+    if (
+      !confirm(
+        `确定删除「${group.ruleName}」下的全部 ${count} 条生图记录？` +
+          `连同已下载到本地的图片一并删除，此操作不可撤销。`
+      )
+    )
+      return;
+    setDeletingGroupId(group.ruleId);
+    try {
+      const res = await apiPost<{ deleted_count?: number; failed?: unknown[] }>(
+        '/api/gen/tasks/delete-by-rule',
+        { rule_id: group.ruleId === '__no_rule__' ? '' : group.ruleId }
+      );
+      const data = unwrapData<{ deleted_count?: number; failed?: unknown[] }>(res);
+      const failedCount = (data?.failed || []).length;
+      if (failedCount) {
+        alert(`已删除 ${data?.deleted_count ?? 0} 条，${failedCount} 条失败`);
+      }
+      /* 重载第一页（组数变了，分页边界也变，不做乐观更新以免与后端不一致） */
+      await loadTasks(1);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '删除失败';
+      alert('删除失败: ' + msg);
+    } finally {
+      setDeletingGroupId(null);
+    }
+  };
+
+  /* 清理废弃数据：删除"所属规则卡已被删除"的孤儿任务（2026-08-18 用户反馈）。
+   * 数据删除必须显式确认，绝不自动清理——用户可能还想留着看图。 */
+  const handleCleanupOrphans = async () => {
+    if (
+      !confirm(
+        `将删除 ${orphanCount} 条废弃记录（它们所属的规则卡已被删除，点进去也打不开），` +
+          `连同已下载到本地的图片一并清理。此操作不可撤销，确定继续？`
+      )
+    )
+      return;
+    setCleaning(true);
+    try {
+      const res = await apiPost<{ deleted_count?: number; failed?: unknown[] }>(
+        '/api/gen/tasks/cleanup-orphans',
+        {}
+      );
+      const data = unwrapData<{ deleted_count?: number; failed?: unknown[] }>(res);
+      const failedCount = (data?.failed || []).length;
+      alert(
+        `已清理 ${data?.deleted_count ?? 0} 条` + (failedCount ? `，${failedCount} 条失败` : '')
+      );
+      await loadTasks(1);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '清理失败';
+      alert('清理失败: ' + msg);
+    } finally {
+      setCleaning(false);
     }
   };
 
@@ -251,10 +368,21 @@ export default function GenPage() {
               🎨 生图任务
             </h1>
           </div>
+          {orphanCount > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleCleanupOrphans}
+              loading={cleaning}
+              title="删除所属规则卡已被删除的废弃记录，释放磁盘空间"
+            >
+              🧹 清理废弃（{orphanCount}）
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"
-            onClick={loadTasks}
+            onClick={() => loadTasks(1)}
             loading={loading}
           >
             🔄 刷新
@@ -340,11 +468,33 @@ export default function GenPage() {
                       <h2 className="text-sm font-mono font-bold text-codex-text truncate">
                         📋 {group.ruleName}
                       </h2>
-                      <Badge>{group.total} 条</Badge>
+                      {/* "全部"筛选下显示该组的真实总条数（后端聚合，与分页无关）；
+                          状态筛选下真实的分状态计数未知，回落为已加载的过滤条数 */}
+                      <Badge>
+                        {filter === 'all'
+                          ? (groupCounts[group.ruleId] ?? group.total)
+                          : group.total}{' '}
+                        条
+                      </Badge>
                     </div>
-                    <span className="text-xs font-mono text-codex-text-secondary shrink-0 ml-2">
-                      {formatTime(group.latestCreatedAt)}
-                    </span>
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
+                      <span className="text-xs font-mono text-codex-text-secondary">
+                        {formatTime(group.latestCreatedAt)}
+                      </span>
+                      {/* 按组删除：整组一次删完（元素变体一组 20+ 条，逐条删要点几十次）。
+                          stopPropagation 防止连带触发标题栏的展开/折叠 */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteGroup(group);
+                        }}
+                        disabled={deletingGroupId === group.ruleId}
+                        title="删除该规则下的全部生图记录"
+                        className="text-xs font-mono text-codex-text-secondary hover:text-codex-danger transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed px-1"
+                      >
+                        {deletingGroupId === group.ruleId ? '删除中…' : '🗑 删除整组'}
+                      </button>
+                    </div>
                   </div>
 
                   {/* 展开后：版本 Tab + 该版本下的任务列表 */}
@@ -549,6 +699,22 @@ export default function GenPage() {
                 </Card>
               );
             })}
+          </div>
+        )}
+
+        {/* 加载更多：后端一页 20 条，历史记录全量保留在磁盘，按页取。
+            注意状态筛选是前端过滤"已加载的任务"，未加载页里的任务要先加载更多才会出现 */}
+        {!loading && !loadError && page < Math.ceil(totalGroups / GROUPS_PER_PAGE) && (
+          <div className="flex justify-center pt-2">
+            <button
+              onClick={() => loadTasks(page + 1)}
+              disabled={loadingMore}
+              className="px-4 py-2 text-sm font-mono rounded-md border border-codex-border text-codex-text hover:border-codex-accent hover:text-codex-accent transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loadingMore
+                ? '加载中…'
+                : `⬇ 加载更多规则（已显示 ${Math.min(page * GROUPS_PER_PAGE, totalGroups)} / 共 ${totalGroups} 个规则）`}
+            </button>
           </div>
         )}
 

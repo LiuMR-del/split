@@ -39,6 +39,10 @@ from services.image_gen_store import (
     get_task,
     update_task,
     list_tasks,
+    list_tasks_by_rule_group,
+    count_tasks_by_rule,
+    find_orphan_task_ids,
+    find_task_ids_by_rule,
     delete_task,
     download_images,
     generate_task_id,
@@ -464,18 +468,95 @@ async def get_gen_task(task_id: str):
     return task.model_dump() if task else {}
 
 
+@router.post("/tasks/delete-by-rule")
+async def delete_tasks_by_rule(payload: dict):
+    """删除某个规则分组下的**全部**生图任务（2026-08-18 用户反馈"怎么按组清理"）。
+
+    此前只能展开分组逐条删（每条一次确认），一个 24 条的元素变体组要点 48 次。
+    用 **POST + 子资源路径**而非带 body 的 DELETE（部分代理对带 body 的 DELETE
+    支持不一致，且这是"批量操作"语义，同 rules 的 batch-delete 约定）。
+    body: {"rule_id": "RULE-0070"}——空字符串表示"未关联规则"那一组。
+    串行复用 `delete_task`（含清理本地图片），单条失败不中断整批。
+    """
+    if not isinstance(payload, dict) or "rule_id" not in payload:
+        raise HTTPException(status_code=400, detail="缺少 rule_id 字段")
+    rule_id = payload.get("rule_id") or ""
+    task_ids = find_task_ids_by_rule(rule_id)
+    if not task_ids:
+        return {"deleted": [], "failed": [], "deleted_count": 0}
+    deleted, failed = [], []
+    for tid in task_ids:
+        try:
+            if delete_task(tid):
+                deleted.append(tid)
+            else:
+                failed.append({"task_id": tid, "error": "记录不存在"})
+        except Exception as e:
+            logging.exception("按规则删除生图任务失败 task_id=%s", tid)
+            failed.append({"task_id": tid, "error": str(e)})
+    return {"deleted": deleted, "failed": failed, "deleted_count": len(deleted)}
+
+
+@router.get("/tasks/orphans")
+async def list_orphan_tasks():
+    """统计"所属规则卡已删除"的孤儿任务（清理入口用，只统计不删）。"""
+    ids = find_orphan_task_ids()
+    return {"count": len(ids), "task_ids": ids}
+
+
+@router.post("/tasks/cleanup-orphans")
+async def cleanup_orphan_tasks():
+    """删除全部孤儿任务（规则卡已删的历史记录 + 其本地图片）。
+
+    2026-08-18 用户反馈"没做废弃数据清理机制"。规则卡删除时不级联删生图任务
+    （历史设计），这些记录点进去 404 还白占磁盘（实测 640MB 里 55 条属于已删规则）。
+    **串行复用已有的 delete_task**（删除逻辑单一事实来源，含清理本地图片文件），
+    单条失败不中断整批，与 rules 批量删除同款三分类响应。
+    """
+    ids = find_orphan_task_ids()
+    deleted, failed = [], []
+    for tid in ids:
+        try:
+            if delete_task(tid):
+                deleted.append(tid)
+            else:
+                failed.append({"task_id": tid, "error": "记录不存在"})
+        except Exception as e:
+            logging.exception("清理孤儿生图任务失败 task_id=%s", tid)
+            failed.append({"task_id": tid, "error": str(e)})
+    return {"deleted": deleted, "failed": failed, "deleted_count": len(deleted)}
+
+
+@router.get("/tasks/group-counts")
+async def get_task_group_counts():
+    """按规则分组的任务真实总条数（前端分组徽标用，与分页无关）。
+
+    2026-08-18：徽标按"已加载任务"计数会在加载更多之前少算（用户反馈），
+    这里返回 SQLite 聚合的全量计数。裸数据格式（gen 路由既有约定）。
+    """
+    return {"counts": count_tasks_by_rule()}
+
+
 @router.get("/tasks")
 async def list_gen_tasks(
     rule_id: Optional[str] = None,
     status: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
+    group_by_rule: bool = False,
 ):
     """
     查询生图任务列表。
 
     支持按规则ID和状态筛选，分页返回。
+
+    group_by_rule=True 时**分页单位是规则组**（page_size 表示组数），本页各组的
+    任务全量返回——生图任务页用这个模式：按任务分页时一次元素变体生成（20+ 条）
+    就吃满一页，点"加载更多"只多冒出一个组，很难用（2026-08-18 用户反馈）。
+    rule_id 指定单规则时不分组（本来就只有一组）。
     """
+    if group_by_rule and not rule_id:
+        return list_tasks_by_rule_group(page=page, page_size=page_size, status=status)
     return list_tasks(
         rule_id=rule_id,
         status=status,
