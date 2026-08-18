@@ -55,10 +55,12 @@ const VERSION_TABS: Record<string, { label: string; short: string }> = {
   A: { label: '📚 资料库关联', short: 'A' },
   B: { label: '🤖 AI 推荐', short: 'B' },
   C: { label: '🔧 自定义模板', short: 'C' },
+  /* 三期阶段四：元素拆分图的任务（ElementExtractSection 提交时写 version='E'） */
+  E: { label: '🧩 元素拆分', short: 'E' },
   [UNVERSIONED]: { label: '📁 未标记版本', short: '?' },
 };
 /* Tab 显示顺序 */
-const VERSION_ORDER = ['A', 'B', 'C', UNVERSIONED];
+const VERSION_ORDER = ['A', 'B', 'C', 'E', UNVERSIONED];
 
 /* 按规则分组后的结构 */
 interface RuleGroup {

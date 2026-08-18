@@ -1,15 +1,18 @@
 """
 规则卡 CRUD 路由
-- GET    /api/rules            → 列表查询（可选 ?level=S 按等级筛选）
-- GET    /api/rules/{rule_id}  → 获取单条规则卡
-- POST   /api/rules            → 保存新规则卡
-- PUT    /api/rules/{rule_id}  → 更新规则卡
-- DELETE /api/rules/{rule_id}  → 删除规则卡
+- GET    /api/rules              → 列表查询（可选 ?level=S 按等级筛选）
+- GET    /api/rules/{rule_id}    → 获取单条规则卡
+- POST   /api/rules              → 保存新规则卡
+- PUT    /api/rules/{rule_id}    → 更新规则卡
+- DELETE /api/rules/{rule_id}    → 删除规则卡
+- POST   /api/rules/batch-delete → 批量删除规则卡（三期追加需求5）
 """
 
-from typing import Optional
+import logging
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from models.rule_card import RuleCard
 from services.rule_store import (
@@ -22,6 +25,15 @@ from services.rule_store import (
 )
 
 router = APIRouter()
+
+# 三期追加需求5：单次批量删除上限。防误传超大列表把请求跑成分钟级
+# （每条要删 JSON + SQLite 行 + uploads 里的原图/缩略图）
+BATCH_DELETE_MAX = 100
+
+
+class BatchDeleteRequest(BaseModel):
+    """批量删除请求"""
+    rule_ids: List[str] = Field(description="要删除的规则卡 ID 列表")
 
 
 @router.get("/rules")
@@ -69,6 +81,56 @@ async def create_rule(rule: RuleCard):
         "success": True,
         "message": f"规则卡 {rule.rule_id} 已保存",
         "data": rule.model_dump(),
+    }
+
+
+@router.post("/rules/batch-delete")
+async def batch_delete_rules(request: BatchDeleteRequest):
+    """
+    批量删除规则卡（三期追加需求5）。
+
+    用 POST + 子资源路径而非 `DELETE` 带 body——部分代理/客户端对带 body 的 DELETE
+    支持不一致，且这是"批量操作"语义。
+
+    串行逐个复用 `delete_rule()`（删除逻辑的单一事实来源，含"先读 JSON 取
+    source_images/thumbnail_path 再删文件"的正确顺序），**单条失败不中断整批**，
+    分类返回结果供前端分条反馈。
+
+    不需要加锁：`delete_rule` 里 `unlink(missing_ok=True)` 和 `DELETE WHERE` 都是
+    幂等操作，重复删不炸；单进程部署下本请求内串行执行。
+    """
+    rule_ids = request.rule_ids
+    if not rule_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一条规则卡")
+    if len(rule_ids) > BATCH_DELETE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次最多删除 {BATCH_DELETE_MAX} 条（本次 {len(rule_ids)} 条）",
+        )
+
+    deleted = []      # type: List[str]
+    not_found = []    # type: List[str]
+    failed = []       # type: List[dict]
+
+    for rule_id in rule_ids:
+        try:
+            if delete_rule(rule_id):
+                deleted.append(rule_id)
+            else:
+                not_found.append(rule_id)
+        except Exception as e:
+            # 单条失败（磁盘/权限/数据损坏等）不影响其余，记全栈便于排查
+            logging.exception("批量删除规则卡 %s 失败", rule_id)
+            failed.append({"rule_id": rule_id, "error": str(e)})
+
+    return {
+        "success": True,
+        "message": f"已删除 {len(deleted)} 条",
+        "data": {
+            "deleted": deleted,
+            "not_found": not_found,
+            "failed": failed,
+        },
     }
 
 

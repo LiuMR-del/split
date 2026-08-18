@@ -14,6 +14,8 @@ import ProductSelect from '@/components/prompts/ProductSelect';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
 import CollapsibleSection from '@/components/ui/CollapsibleSection';
 import { getCustomValuesForRule, addCustomValue } from '@/lib/localStorage';
+import { addCustomProductIfNew } from '@/lib/userPrefs';
+import ElementExtractSection from '@/components/prompts/ElementExtractSection';
 
 /* 二期批次一：界面精简开关，改 true 恢复显示 */
 const SHOW_INFO_CARDS = false;
@@ -153,6 +155,13 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
       setError('请先选择目标产品');
       return;
     }
+
+    /* 三期阶段一：手填的自定义产品名落后端持久化（与下面按规则卡隔离的维度自定义值不同，
+     * 产品名是全局的、跟着人走）。fire-and-forget，不 await。 */
+    addCustomProductIfNew(
+      targetProduct,
+      (template?.product_options || []).map((o) => o.value),
+    );
 
     setGenerating(true);
     setError('');
@@ -368,6 +377,10 @@ export default function PromptVersionC({ ruleId, ruleCard }: PromptVersionCProps
           ruleImageUrl={ruleCard?.thumbnail_path || ''}
         />
       )}
+
+      {/* 三期阶段四：元素拆分图（衍生）。不依赖版本C 是否已生成提示词，只要有规则卡即可用。
+          入口是按钮触发——未点击前零请求、不渲染面板（低频功能，见 §6.4.1）。 */}
+      <ElementExtractSection ruleId={ruleId} ruleCard={ruleCard} />
     </div>
   );
 }

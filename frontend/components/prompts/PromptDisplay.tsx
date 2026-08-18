@@ -14,7 +14,23 @@ import Button from '@/components/ui/Button';
 import Select from '@/components/ui/Select';
 import CollapsibleSection from '@/components/ui/CollapsibleSection';
 import FileUpload from '@/components/ui/FileUpload';
-import { apiPost, apiGet, apiUpload, unwrapData } from '@/lib/api';
+import { apiPost, apiGet, apiUpload, unwrapData, getImageUrl } from '@/lib/api';
+import {
+  PRODUCT_SIZE_PRESETS,
+  API_MAX_SIZE,
+  CUSTOM_SIZE_PREFIX,
+  clampToApiMax,
+  buildSizeOptions,
+  resolveSizeByValue,
+} from '@/lib/sizePresets';
+import {
+  fetchPrefs,
+  addCustomSize,
+  removeCustomSize,
+  saveLastSize,
+  CustomSizePreset,
+} from '@/lib/userPrefs';
+import { getSupportsReference, getCachedSupportsReference } from '@/lib/genConfig';
 
 /* 提示词生成结果类型 */
 export interface PromptResult {
@@ -77,6 +93,9 @@ interface PromptDisplayProps {
   hasRuleImage?: boolean;
   /** #7：竞品原图的完整可访问 URL（取 ruleCard.thumbnail_path），用于开关旁的小缩略图预览 */
   ruleImageUrl?: string;
+  /** 三期阶段三（用户反馈合并）：版本B 多方案信息。传了才在「生成图片」区显示
+   *  「批量多方案」tab，与「单张精修」共用尺寸/附带原图设置。其他版本不传。 */
+  batchMode?: BatchModeInfo;
 }
 
 /* 生图提交响应 */
@@ -385,38 +404,10 @@ function CollapsiblePromptBlock({
 }
 
 /**
- * 产品尺寸预设数据（基于实际印刷尺寸）
- * 选择后自动填充宽高，提交时等比缩放到 API 限制范围内
+ * 产品尺寸预设 + API 尺寸上限已抽到 lib/sizePresets.ts（共享单一事实来源，
+ * 三期阶段一起多处要用：这里的生图区、后续阶段三的批量生成栏）。
+ * gcd/calcRatioText 只有本文件用，留在这里。
  */
-const PRODUCT_SIZE_PRESETS = [
-  // 毛毯
-  { label: '[毛毯] 30×40 (3066×4000)', value: 'blanket_30x40', width: 3066, height: 4000, category: '毛毯 Blanket' },
-  { label: '[毛毯] 40×50 (3000×3868)', value: 'blanket_40x50', width: 3000, height: 3868, category: '毛毯 Blanket' },
-  { label: '[毛毯] 50×60 (3480×4000)', value: 'blanket_50x60', width: 3480, height: 4000, category: '毛毯 Blanket' },
-  { label: '[毛毯] 60×80 (4000×5297)', value: 'blanket_60x80', width: 4000, height: 5297, category: '毛毯 Blanket' },
-  // 沙滩巾
-  { label: '[沙滩巾] 80×160 (2060×4000)', value: 'beach_80x160', width: 2060, height: 4000, category: '沙滩巾 Beach Towel' },
-  { label: '[沙滩巾] 70×140 (2028×4000)', value: 'beach_70x140', width: 2028, height: 4000, category: '沙滩巾 Beach Towel' },
-  // 衣服
-  { label: '[衣服] 短袖 (850×1049)', value: 'tshirt', width: 850, height: 1049, category: '衣服 Apparel' },
-  { label: '[衣服] 长袖 (1121×1200)', value: 'longsleeve', width: 1121, height: 1200, category: '衣服 Apparel' },
-  { label: '[衣服] 袖子 (1200×899)', value: 'sleeve', width: 1200, height: 899, category: '衣服 Apparel' },
-  // 横幅
-  { label: '[横幅] 6000×2614', value: 'banner', width: 6000, height: 2614, category: '横幅 Banner' },
-  // 相框
-  { label: '[相框] 横板 (6000×4000)', value: 'frame_landscape', width: 6000, height: 4000, category: '相框 Frame' },
-  { label: '[相框] 竖版 (4000×6000)', value: 'frame_portrait', width: 4000, height: 6000, category: '相框 Frame' },
-  // 花园旗
-  { label: '[花园旗] 3:4 (3000×4000)', value: 'garden_flag', width: 3000, height: 4000, category: '花园旗 Garden Flag' },
-  // 通用
-  { label: '[通用] 正方形 1:1 (1024×1024)', value: 'square', width: 1024, height: 1024, category: '通用' },
-  { label: '[通用] 竖版 3:4 (1024×1365)', value: 'portrait_3_4', width: 1024, height: 1365, category: '通用' },
-  { label: '[通用] 竖版 9:16 (1024×1820)', value: 'portrait_9_16', width: 1024, height: 1820, category: '通用' },
-  { label: '[通用] 横版 16:9 (1820×1024)', value: 'landscape_16_9', width: 1820, height: 1024, category: '通用' },
-] as const;
-
-/** 生图 API 最大尺寸限制（AIReiter） */
-const API_MAX_SIZE = 1600;
 
 /** GCD 算法 —— 用于计算宽高的近似比例 */
 function gcd(a: number, b: number): number {
@@ -541,9 +532,35 @@ function CustomizationSlotsSection({
   );
 }
 
+/* 三期阶段三（用户反馈合并）：批量多方案模式需要的信息。
+ * 由 PromptVersionB 通过 PromptDisplay 透传下来；其他版本不传 = 没有批量 tab。 */
+export interface BatchModeInfo {
+  /** 全部方案（含未勾选的），提交时按 checkedIdx 取 */
+  directions: PromptResult[];
+  /** 用户在方案卡片上勾选的索引 */
+  checkedIdx: Set<number>;
+}
+
+/* 批量模式下每套方案的提交结果 */
+interface BatchItemResult {
+  status: 'submitting' | 'done' | 'failed';
+  taskId?: string;
+  /** 同步模式下 submit 直接返回图片 URL，不用轮询就能显示 */
+  imageUrl?: string;
+  error?: string;
+  /** 点过下载后的本地可访问路径 */
+  localUrl?: string;
+  downloading?: boolean;
+}
+
 /**
  * 一键生图操作区组件
  * 提交生图任务、轮询状态、展示结果
+ *
+ * 三期阶段三（用户反馈合并）：原来"批量生成勾选方案"是独立一栏，与本区各有一套
+ * 尺寸下拉/附带原图开关，重复且割裂。现在合并为本区内的两个 tab——
+ * 「单张精修」（原有行为，一行不改）/「批量多方案」（每套 1 张），
+ * **尺寸与附带竞品原图设置两个模式共用**，切 tab 只换下方的专属选项与结果区。
  */
 function ImageGenSection({
   ruleId,
@@ -555,6 +572,7 @@ function ImageGenSection({
   referencePaths,
   onReferencePathsChange,
   onAppendFragment,
+  batchMode,
 }: {
   ruleId: string;
   ruleName?: string;
@@ -569,12 +587,32 @@ function ImageGenSection({
   onReferencePathsChange: (paths: string[]) => void;
   /** #8：点"拼入提示词"时把分析出的英文片段追加到父组件当前激活模式的提示词 */
   onAppendFragment: (fragment: string) => void;
+  /** 三期阶段三：多方案信息，仅版本B 多方案模式传；不传则不显示批量 tab */
+  batchMode?: BatchModeInfo;
 }) {
+  /* 三期阶段三：当前模式。有批量信息时才可切换，否则恒为 single */
+  const [genMode, setGenMode] = useState<'single' | 'batch'>('single');
+  /* 批量模式每套方案的提交结果，key 是方案索引 */
+  const [batchResults, setBatchResults] = useState<Record<number, BatchItemResult>>({});
+  const [batchSubmitting, setBatchSubmitting] = useState(false);
+  const [batchDoneHint, setBatchDoneHint] = useState('');
   /* 产品尺寸预设选中值 */
   const [sizePreset, setSizePreset] = useState('square');
   /* 尺寸 */
   const [width, setWidth] = useState(1024);
   const [height, setHeight] = useState(1024);
+  /* 三期阶段一：后端持久化的自定义尺寸预设 */
+  const [customPresets, setCustomPresets] = useState<CustomSizePreset[]>([]);
+  /* "保存为常用尺寸"内联小表单 */
+  const [showSaveForm, setShowSaveForm] = useState(false);
+  const [saveLabel, setSaveLabel] = useState('');
+  const [savingPreset, setSavingPreset] = useState(false);
+  const [presetError, setPresetError] = useState('');
+  /* 用户是否动过尺寸控件——动过就不再用 last_size 覆盖他的选择
+   * （fetchPrefs 是异步的，可能在用户已经改完尺寸之后才返回） */
+  const touchedRef = useRef(false);
+  /* last_size 保存的 debounce 定时器（宽高输入框每敲一个字符都会触发，不能每次都发请求） */
+  const saveSizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /* 生成数量 */
   const [count, setCount] = useState(1);
   /* 提交状态 */
@@ -593,39 +631,118 @@ function ImageGenSection({
   /* 选中预览的大图 */
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  /* 构建 Select 下拉选项（按 category 分组，label 带前缀） */
-  const presetOptions = useMemo(() => {
-    const opts: Array<{ label: string; value: string }> = [
-      { label: '请选择产品尺寸', value: '' },
-    ];
-    for (const p of PRODUCT_SIZE_PRESETS) {
-      opts.push({ label: p.label, value: p.value });
-    }
-    return opts;
+  /* 三期阶段一：挂载时恢复"上次使用的尺寸" + 加载自定义预设。
+   * touchedRef 守卫：如果偏好回来之前用户已经改过尺寸，就不覆盖他的选择。 */
+  useEffect(() => {
+    let cancelled = false;
+    fetchPrefs().then((prefs) => {
+      if (cancelled) return;
+      setCustomPresets(prefs.custom_size_presets);
+      const last = prefs.last_size;
+      if (touchedRef.current || !last) return;
+      /* preset 可能指向一个已被删除的自定义预设 → 退回手动模式（宽高仍恢复，
+       * 宽高才是权威值，preset 只是"当时从哪个下拉项来的"） */
+      const presetExists =
+        !!last.preset &&
+        (PRODUCT_SIZE_PRESETS.some((p) => p.value === last.preset) ||
+          (last.preset.startsWith(CUSTOM_SIZE_PREFIX) &&
+            prefs.custom_size_presets.some(
+              (p) => CUSTOM_SIZE_PREFIX + p.label === last.preset
+            )));
+      setSizePreset(presetExists ? last.preset : '');
+      setWidth(last.width);
+      setHeight(last.height);
+    });
+    return () => { cancelled = true; };
   }, []);
+
+  /* 卸载时清掉未触发的 debounce 定时器 */
+  useEffect(() => {
+    return () => {
+      if (saveSizeTimerRef.current) clearTimeout(saveSizeTimerRef.current);
+    };
+  }, []);
+
+  /* 构建 Select 下拉选项：内置预设 + 用户保存的自定义预设
+   * （三期阶段三：构建逻辑抽到 lib/sizePresets.ts，与批量生成栏共用） */
+  const presetOptions = useMemo(() => buildSizeOptions(customPresets), [customPresets]);
 
   /* 计算当前宽高的近似比例文本 */
   const ratioText = useMemo(() => calcRatioText(width, height), [width, height]);
 
-  /* 选择预设时自动填充宽高 */
+  /* 三期阶段一：debounce 记住上次使用的尺寸。
+   * 新值直接当参数传进来，不读闭包里的旧 state（宽高输入是连续触发的，
+   * 读闭包会把中间态存进去）。 */
+  const scheduleSaveLastSize = (preset: string, w: number, h: number) => {
+    if (saveSizeTimerRef.current) clearTimeout(saveSizeTimerRef.current);
+    saveSizeTimerRef.current = setTimeout(() => {
+      saveLastSize({ preset, width: w, height: h });
+    }, 500);
+  };
+
+  /* 选择预设时自动填充宽高（含自定义预设） */
   const handlePresetChange = (val: string) => {
+    touchedRef.current = true;
     setSizePreset(val);
-    if (!val) return; /* "请选择" 空值 */
-    const preset = PRODUCT_SIZE_PRESETS.find((p) => p.value === val);
-    if (preset) {
-      setWidth(preset.width);
-      setHeight(preset.height);
+    setPresetError('');
+    /* 解析逻辑抽到 lib/sizePresets.ts 与批量生成栏共用；
+     * 空值或找不到（预设已删）时保持当前宽高不变，只记录 preset 变化 */
+    const resolved = resolveSizeByValue(val, customPresets);
+    if (resolved) {
+      setWidth(resolved.width);
+      setHeight(resolved.height);
+      scheduleSaveLastSize(val, resolved.width, resolved.height);
+    } else {
+      scheduleSaveLastSize(val, width, height);
     }
   };
 
   /* 手动修改宽高时，预设变为空（自定义） */
   const handleWidthChange = (v: number) => {
-    setWidth(v || 1024);
+    touchedRef.current = true;
+    const next = v || 1024;
+    setWidth(next);
     setSizePreset('');
+    scheduleSaveLastSize('', next, height);
   };
   const handleHeightChange = (v: number) => {
-    setHeight(v || 1024);
+    touchedRef.current = true;
+    const next = v || 1024;
+    setHeight(next);
     setSizePreset('');
+    scheduleSaveLastSize('', width, next);
+  };
+
+  /* 保存当前宽高为常用尺寸预设 */
+  const handleSavePreset = async () => {
+    const label = saveLabel.trim();
+    if (!label) return;
+    setSavingPreset(true);
+    setPresetError('');
+    try {
+      const list = await addCustomSize({ label, width, height });
+      setCustomPresets(list);
+      setSizePreset(CUSTOM_SIZE_PREFIX + label);
+      scheduleSaveLastSize(CUSTOM_SIZE_PREFIX + label, width, height);
+      setShowSaveForm(false);
+      setSaveLabel('');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '保存失败';
+      setPresetError(msg);
+    } finally {
+      setSavingPreset(false);
+    }
+  };
+
+  /* 删除当前选中的自定义尺寸预设（宽高保持不变，只是不再出现在下拉里） */
+  const handleDeletePreset = async () => {
+    if (!sizePreset.startsWith(CUSTOM_SIZE_PREFIX)) return;
+    const label = sizePreset.slice(CUSTOM_SIZE_PREFIX.length);
+    const list = await removeCustomSize(label);
+    setCustomPresets(list);
+    setSizePreset('');
+    touchedRef.current = true;
+    scheduleSaveLastSize('', width, height);
   };
 
   /* #8：生图流程参考图上传——每一项是用户添加的一张待处理参考图（选图→填用途→AI分析→拼入）。
@@ -783,14 +900,9 @@ function ImageGenSection({
     setMultiTaskHint('');  // #8：清空多任务提示
 
     try {
-      /* 等比缩放到 API 最大尺寸限制（保持比例） */
-      let submitWidth = width;
-      let submitHeight = height;
-      if (submitWidth > API_MAX_SIZE || submitHeight > API_MAX_SIZE) {
-        const scale = API_MAX_SIZE / Math.max(submitWidth, submitHeight);
-        submitWidth = Math.round(submitWidth * scale);
-        submitHeight = Math.round(submitHeight * scale);
-      }
+      /* 等比缩放到 API 最大尺寸限制（保持比例）
+       * 三期阶段三：缩放规则抽到 lib/sizePresets.ts，与批量生成栏共用同一份 */
+      const { width: submitWidth, height: submitHeight } = clampToApiMax(width, height);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res = await apiPost<any>('/api/gen/submit', {
@@ -833,21 +945,166 @@ function ImageGenSection({
   /* 数量按钮组选项 */
   const countOptions = [1, 2, 3, 4];
 
+  /* ── 三期阶段三（合并后）：批量多方案模式 ── */
+  const checkedList = batchMode
+    ? Array.from(batchMode.checkedIdx).sort((a, b) => a - b)
+    : [];
+  /* 勾选的方案是否都有编辑指令提示词（缺一个就整批不能走编辑模式） */
+  const allCheckedHaveEdit = checkedList.length > 0
+    && checkedList.every((i) => Boolean(batchMode?.directions[i]?.image_prompt_edit));
+  /* 批量模式实际用不用编辑指令：沿用上方开关（attachRuleImage），
+   * 但勾选的方案里只要有一套没有 image_prompt_edit 就整批回落完整描述模式 */
+  const batchUseEdit = attachRuleImage && allCheckedHaveEdit;
+
+  /* 串行提交勾选的方案（每套 1 张）。串行而非并发：OpenAI 图片 API 限流严
+   * （Tier 1 个位数 RPM），并发会集体 429（同后端 #8 的处理）。
+   * 同步模式下 submit 响应里已带 image_urls，所以不用轮询就能直接显示图。 */
+  const handleBatchSubmit = async () => {
+    if (!batchMode || checkedList.length === 0) return;
+    setBatchSubmitting(true);
+    setBatchDoneHint('');
+    setBatchResults({});
+    const { width: w, height: h } = clampToApiMax(width, height);
+
+    let okCount = 0;
+    for (const idx of checkedList) {
+      const d = batchMode.directions[idx];
+      setBatchResults((prev) => ({ ...prev, [idx]: { status: 'submitting' } }));
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const res = await apiPost<any>('/api/gen/submit', {
+          rule_id: ruleId,
+          rule_name: ruleName || '',
+          version: version || 'B',
+          count: 1,
+          width: w,
+          height: h,
+          prompt_positive: batchUseEdit
+            ? (d.image_prompt_edit || d.image_prompt_positive)
+            : d.image_prompt_positive,
+          prompt_negative: d.image_prompt_negative || '',
+          attach_rule_image: batchUseEdit,
+          reference_image_paths: [],
+        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data = unwrapData<any>(res);
+        const task = data?.tasks?.[0] || data;
+        const tid = task?.task_id || '';
+        if (!tid) {
+          throw new Error(data?.message || data?.errors || '未返回任务 ID');
+        }
+        /* 同步模式（api_type=openai）submit 返回时图已生成，image_urls 直接可用；
+         * 异步模式（aireiter）此时还没图，留空，用户去生图任务页看 */
+        const url = Array.isArray(task?.image_urls) ? task.image_urls[0] : '';
+        okCount += 1;
+        setBatchResults((prev) => ({
+          ...prev,
+          [idx]: { status: 'done', taskId: tid, imageUrl: url || undefined },
+        }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '提交失败';
+        setBatchResults((prev) => ({ ...prev, [idx]: { status: 'failed', error: msg } }));
+      }
+    }
+    setBatchSubmitting(false);
+    if (okCount > 0) {
+      setBatchDoneHint(`已完成 ${okCount} 套`);
+    }
+  };
+
+  /* 批量结果里某张图的"下载到本地"——调现有 POST /api/gen/download/{task_id}，
+   * 拿到 accessible_paths[0] 后用隐藏 <a download> 触发保存 */
+  const handleDownloadOne = async (idx: number) => {
+    const item = batchResults[idx];
+    if (!item?.taskId) return;
+    setBatchResults((prev) => ({ ...prev, [idx]: { ...prev[idx], downloading: true } }));
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = await apiPost<any>(`/api/gen/download/${item.taskId}`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data = unwrapData<any>(res);
+      const path = data?.accessible_paths?.[0];
+      if (!path) throw new Error('未返回可下载路径');
+      const url = getImageUrl(path);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = path.split('/').pop() || `方案${idx + 1}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setBatchResults((prev) => ({ ...prev, [idx]: { ...prev[idx], downloading: false, localUrl: url } }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '下载失败';
+      setBatchResults((prev) => ({ ...prev, [idx]: { ...prev[idx], downloading: false, error: msg } }));
+    }
+  };
+
   return (
     <div className="space-y-3">
+      {/* 三期阶段三（合并后）：模式切换 tab。只有版本B 多方案传了 batchMode 时才显示；
+          尺寸与"附带竞品原图"设置两个模式共用，切 tab 只换下方专属选项与结果区。 */}
+      {batchMode && (
+        <div className="flex gap-1 p-1 bg-codex-bg border border-codex-border rounded-md">
+          <button
+            onClick={() => setGenMode('single')}
+            className={`
+              flex-1 px-3 py-1.5 text-xs font-mono rounded
+              transition-colors duration-150 cursor-pointer
+              ${genMode === 'single'
+                ? 'bg-codex-accent text-white'
+                : 'text-codex-text-secondary hover:text-codex-text'}
+            `}
+          >
+            🎯 单张精修（当前方案）
+          </button>
+          <button
+            onClick={() => setGenMode('batch')}
+            className={`
+              flex-1 px-3 py-1.5 text-xs font-mono rounded
+              transition-colors duration-150 cursor-pointer
+              ${genMode === 'batch'
+                ? 'bg-codex-accent text-white'
+                : 'text-codex-text-secondary hover:text-codex-text'}
+            `}
+          >
+            🚀 批量多方案（{checkedList.length} 套）
+          </button>
+        </div>
+      )}
+
       {/* #8：多任务过渡提示（count>1 提交后显示，提示其余任务去生图任务页）*/}
-      {multiTaskHint && (
+      {multiTaskHint && genMode === 'single' && (
         <div className="px-3 py-2 bg-purple-900/20 border border-purple-700/40 rounded-md">
           <p className="text-xs font-mono text-purple-300">ℹ️ {multiTaskHint}</p>
         </div>
       )}
-      {/* 产品尺寸预设下拉框 */}
-      <Select
-        label="产品尺寸"
-        options={presetOptions}
-        value={sizePreset}
-        onChange={handlePresetChange}
-      />
+      {/* 产品尺寸预设下拉框。三期阶段一：合并了用户保存的自定义预设，
+          选中自定义预设时右侧出现删除按钮 */}
+      <div className="flex items-end gap-2">
+        <div className="flex-1 min-w-0">
+          <Select
+            label="产品尺寸"
+            options={presetOptions}
+            value={sizePreset}
+            onChange={handlePresetChange}
+          />
+        </div>
+        {sizePreset.startsWith(CUSTOM_SIZE_PREFIX) && (
+          <button
+            onClick={handleDeletePreset}
+            className="
+              px-2 py-2 text-sm font-mono rounded-md shrink-0
+              bg-codex-bg text-codex-text-secondary
+              border border-codex-border
+              hover:text-codex-danger hover:border-codex-danger
+              transition-colors duration-150 cursor-pointer
+            "
+            title="删除这个自定义尺寸预设"
+          >
+            🗑
+          </button>
+        )}
+      </div>
 
       {/* 宽高输入 + 比例显示 —— 窄栏内垂直排列 */}
       <div className="space-y-2">
@@ -882,9 +1139,54 @@ function ImageGenSection({
             </span>
           )}
         </div>
+
+        {/* 三期阶段一：手动输入尺寸时可存为常用预设，下次直接从下拉框选 */}
+        {!sizePreset && (
+          <div className="space-y-1.5">
+            {showSaveForm ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={saveLabel}
+                  onChange={(e) => setSaveLabel(e.target.value)}
+                  placeholder="尺寸名称，如 抱枕 45x45"
+                  autoFocus
+                  className="flex-1 min-w-[8rem] px-2 py-1 text-xs font-mono bg-codex-bg text-codex-text border border-codex-accent rounded-md placeholder:text-codex-text-secondary/50 focus:outline-none focus:ring-1 focus:ring-codex-accent/30"
+                />
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={handleSavePreset}
+                  loading={savingPreset}
+                  disabled={!saveLabel.trim()}
+                >
+                  ✅ 保存
+                </Button>
+                <button
+                  onClick={() => { setShowSaveForm(false); setSaveLabel(''); setPresetError(''); }}
+                  className="px-2 py-1 text-xs font-mono rounded-md bg-codex-bg text-codex-text-secondary border border-codex-border hover:text-codex-text hover:border-codex-accent transition-colors cursor-pointer"
+                >
+                  取消
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowSaveForm(true)}
+                className="px-2 py-1 text-xs font-mono rounded-md bg-codex-bg text-codex-text-secondary border border-codex-border hover:text-codex-text hover:border-codex-accent transition-colors cursor-pointer"
+                title="把当前宽高保存为常用尺寸，下次可直接从下拉框选择"
+              >
+                💾 保存为常用尺寸
+              </button>
+            )}
+            {presetError && (
+              <p className="text-xs font-mono text-codex-danger">❌ {presetError}</p>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* 数量选择（按钮组）—— 窄栏中自动换行 */}
+      {/* 数量选择（按钮组）—— 窄栏中自动换行。批量模式每套固定 1 张，不显示 */}
+      {genMode === 'single' && (
       <div className="flex flex-wrap items-center gap-3">
         <span className="text-sm font-mono text-codex-text-secondary min-w-[3rem]">数量:</span>
         <div className="flex gap-2">
@@ -906,9 +1208,11 @@ function ImageGenSection({
           ))}
         </div>
       </div>
-
+      )}
       {/* #8：生图流程参考图上传——折叠区，默认收起（不是每次生图都需要额外参考图，
-          收起减少视觉干扰）。支持添加多张，每张独立填写用途+AI分析+拼入/删除。 */}
+          收起减少视觉干扰）。支持添加多张，每张独立填写用途+AI分析+拼入/删除。
+          批量模式不显示：批量走各方案的原始提示词，拼入参考图片段只会影响当前方案。 */}
+      {genMode === 'single' && (
       <CollapsibleSection title="➕ 添加参考图" defaultExpanded={false}>
         <div className="space-y-3">
           {refItems.map((item, idx) => (
@@ -980,7 +1284,11 @@ function ImageGenSection({
           <FileUpload onFileSelect={handleAddRefImage} />
         </div>
       </CollapsibleSection>
+      )}
 
+      {/* ── 单张精修模式：原有的生成按钮 + 轮询 + 结果（行为一行未改） ── */}
+      {genMode === 'single' && (
+      <>
       {/* 生成按钮 */}
       <Button
         variant="primary"
@@ -1049,6 +1357,124 @@ function ImageGenSection({
           </div>
         </div>
       )}
+      </>
+      )}
+
+      {/* ── 三期阶段三（合并后）：批量多方案模式 ── */}
+      {genMode === 'batch' && batchMode && (
+        <>
+          <p className="text-sm font-mono text-codex-text">
+            已勾选 <span className="text-codex-accent font-bold">{checkedList.length}</span> / {batchMode.directions.length} 套
+            <span className="text-codex-text-secondary ml-2">（在上方方案卡片勾选）</span>
+          </p>
+
+          <Button
+            variant="primary"
+            onClick={handleBatchSubmit}
+            loading={batchSubmitting}
+            disabled={checkedList.length === 0}
+          >
+            🎨 生成勾选的 {checkedList.length} 套（每套 1 张）
+          </Button>
+
+          {batchSubmitting && (
+            <p className="text-xs font-mono text-codex-text-secondary">
+              ⏳ 串行生成中，同步模式下每套最长可能等待约 5 分钟，请勿刷新页面
+            </p>
+          )}
+
+          {/* 每套的状态 + 出图。同步模式下 submit 返回即带图，直接渲染，不用轮询 */}
+          {Object.keys(batchResults).length > 0 && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                {checkedList.map((idx) => {
+                  const st = batchResults[idx];
+                  if (!st) return null;
+                  return (
+                    <div key={idx} className="bg-codex-bg border border-codex-border rounded-md overflow-hidden">
+                      {/* 图片区 */}
+                      {st.imageUrl ? (
+                        <div
+                          className="cursor-pointer hover:opacity-90 transition-opacity"
+                          onClick={() => setPreviewUrl(st.imageUrl!)}
+                          title="点击查看大图"
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={st.imageUrl}
+                            alt={`方案 ${idx + 1} 生成图`}
+                            className="w-full h-32 object-cover"
+                          />
+                        </div>
+                      ) : (
+                        <div className="w-full h-32 flex items-center justify-center bg-codex-card">
+                          {st.status === 'submitting' && (
+                            <span className="inline-block w-6 h-6 border-2 border-codex-warning border-t-transparent rounded-full animate-spin" />
+                          )}
+                          {st.status === 'failed' && <span className="text-2xl">❌</span>}
+                          {st.status === 'done' && (
+                            <span className="text-[10px] font-mono text-codex-text-secondary text-center px-2">
+                              已提交，异步模式请到「生图任务」页看图
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {/* 信息 + 下载 */}
+                      <div className="p-1.5 space-y-1">
+                        <p className="text-[11px] font-mono text-codex-text text-center">
+                          方案 {idx + 1}
+                          {st.status === 'submitting' && <span className="text-codex-warning"> · 生成中…</span>}
+                        </p>
+                        {st.status === 'failed' && (
+                          <p className="text-[10px] font-mono text-codex-danger truncate" title={st.error}>
+                            {st.error}
+                          </p>
+                        )}
+                        {st.status === 'done' && st.taskId && (
+                          <>
+                            <p className="text-[10px] font-mono text-codex-text-secondary text-center truncate" title={st.taskId}>
+                              {st.taskId}
+                            </p>
+                            {st.imageUrl && (
+                              <button
+                                onClick={() => handleDownloadOne(idx)}
+                                disabled={st.downloading}
+                                className="w-full px-1 py-0.5 text-[10px] font-mono rounded bg-codex-card text-codex-text-secondary border border-codex-border hover:text-codex-text hover:border-codex-accent transition-colors cursor-pointer disabled:cursor-wait"
+                              >
+                                {st.downloading ? '⏳ 下载中…' : '⬇ 下载'}
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {batchDoneHint && (
+            <div className="px-3 py-2 bg-green-900/20 border border-codex-success/50 rounded-md space-y-1">
+              <p className="text-xs font-mono text-codex-success">✅ {batchDoneHint}</p>
+              <Link href="/gen" className="text-xs font-mono text-codex-accent hover:underline">
+                → 前往生图任务页（查看历史与更多操作）
+              </Link>
+            </div>
+          )}
+
+          {/* 范围限制明示 */}
+          <p className="text-[11px] font-mono text-codex-text-secondary leading-relaxed">
+            ℹ️ 批量生成使用各方案的<span className="text-codex-warning">原始提示词</span>，不包含「可定制项」勾选与手动编辑的内容；
+            需要这些请切到「🎯 单张精修」，它用的是上方编辑区里当前方案的提示词。
+            {!allCheckedHaveEdit && checkedList.length > 0 && attachRuleImage && (
+              <span className="text-codex-warning">
+                {' '}当前有勾选方案缺少编辑指令提示词，本批将统一使用完整描述模式。
+              </span>
+            )}
+          </p>
+        </>
+      )}
 
       {/* 大图预览遮罩 */}
       {previewUrl && (
@@ -1088,12 +1514,10 @@ function applyFragments(base: string, fragments: string[]): string {
     : `${fragments.join(', ')}, each customizable element appears only once`;
 }
 
-/* #7：GET /api/gen/config 的 supports_reference 结果模块级缓存——A/B/C 三版各自
- * 渲染一个 PromptDisplay 实例，都要用这个值，缓存后只需请求一次，不用三份重复请求。
- * null 表示还没取过。 */
-let _supportsReferenceCache: boolean | null = null;
+/* #7：supports_reference 的模块级缓存已抽到 lib/genConfig.ts（三期阶段三）——
+ * A/B/C 三个 PromptDisplay 实例 + 版本B 批量生成栏都要这个值，共用一份缓存只请求一次。 */
 
-export default function PromptDisplay({ result, ruleId, ruleName, version, hasRuleImage, ruleImageUrl }: PromptDisplayProps) {
+export default function PromptDisplay({ result, ruleId, ruleName, version, hasRuleImage, ruleImageUrl, batchMode }: PromptDisplayProps) {
   /* R3：维护"编辑后"的提示词 state，初始取 result 的值，result 变化（重新生成）时重置。
    * MergedPromptBlock 编辑完成时回写这里，ImageGenSection 用这里的值生图，
    * 修复原 bug：编辑后显示/生图仍是原值。R4 将在此基础上叠加可定制项勾选片段。 */
@@ -1102,21 +1526,16 @@ export default function PromptDisplay({ result, ruleId, ruleName, version, hasRu
   /* #7：编辑指令式提示词的编辑态，随 result 同步的模式和 editablePositive 一致 */
   const [editableEdit, setEditableEdit] = useState(result.image_prompt_edit || '');
   /* #7：当前生图接口是否支持带参考图（GET /api/gen/config 的 supports_reference，
-   * 挂载时取一次，用模块级缓存避免 A/B/C 三个 PromptDisplay 实例各发一次请求） */
-  const [supportsReference, setSupportsReference] = useState<boolean>(_supportsReferenceCache ?? false);
+   * 挂载时取一次，lib/genConfig.ts 的模块级缓存避免多个实例各发一次请求） */
+  const [supportsReference, setSupportsReference] = useState<boolean>(
+    getCachedSupportsReference() ?? false
+  );
   useEffect(() => {
-    if (_supportsReferenceCache !== null) return;
+    if (getCachedSupportsReference() !== null) return;
     let cancelled = false;
-    apiGet<any>('/api/gen/config') // eslint-disable-line @typescript-eslint/no-explicit-any
-      .then((res) => {
-        const supports = Boolean(unwrapData<any>(res)?.supports_reference); // eslint-disable-line @typescript-eslint/no-explicit-any
-        _supportsReferenceCache = supports;
-        if (!cancelled) setSupportsReference(supports);
-      })
-      .catch(() => {
-        _supportsReferenceCache = false;
-        if (!cancelled) setSupportsReference(false);
-      });
+    getSupportsReference().then((supports) => {
+      if (!cancelled) setSupportsReference(supports);
+    });
     return () => { cancelled = true; };
   }, []);
   /* #7：是否使用"附带竞品原图"编辑模式。初始值：有竞品图 + 后端返回了编辑指令提示词
@@ -1458,6 +1877,7 @@ export default function PromptDisplay({ result, ruleId, ruleName, version, hasRu
             referencePaths={referencePaths}
             onReferencePathsChange={setReferencePaths}
             onAppendFragment={handleAppendFragment}
+            batchMode={batchMode}
           />
         </CollapsibleSection>
       )}

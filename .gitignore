@@ -25,6 +25,8 @@ backend/data/uploads/
 backend/data/rules/
 backend/data/library/
 backend/data/gen/
+# 三期阶段一新增：用户偏好（自定义产品名/尺寸预设），属用户数据不入库
+backend/data/user_prefs.json
 backend/.env
 
 # OS

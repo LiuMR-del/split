@@ -14,6 +14,7 @@ from routers.vocabularies import router as vocabularies_router
 from routers.prompts import router as prompts_router
 from routers.library import router as library_router
 from routers.image_gen import router as image_gen_router
+from routers.user_prefs import router as user_prefs_router
 from services.rule_store import init_db
 from services.image_library_store import init_image_library_db
 from services.image_gen_store import init_image_gen_db
@@ -66,6 +67,7 @@ app.include_router(vocabularies_router, prefix="/api")
 app.include_router(prompts_router, prefix="/api")
 app.include_router(library_router, prefix="/api")
 app.include_router(image_gen_router, prefix="/api")
+app.include_router(user_prefs_router, prefix="/api")
 
 
 @app.on_event("startup")

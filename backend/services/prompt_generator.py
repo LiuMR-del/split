@@ -11,7 +11,13 @@ import json
 import logging
 from typing import List, Optional
 
-from prompts.prompt_generation import get_recommendation_prompt, get_customization_analysis_prompt, get_option_translation_prompt
+from prompts.prompt_generation import (
+    get_recommendation_prompt,
+    get_customization_analysis_prompt,
+    get_option_translation_prompt,
+    ELEMENT_EXTRACTION_PROMPT_TEMPLATE,
+    ELEMENT_VARIANT_PROMPT_TEMPLATE,
+)
 from services.ai_response_utils import extract_json_from_ai_response
 from services.vocab_utils import extract_english_part
 
@@ -76,6 +82,7 @@ class PromptGenerator:
         rule_card: dict,
         target_product: str,
         library_recommendations: Optional[List[dict]] = None,
+        num_directions: int = 1,
     ) -> dict:
         """版本 B：AI 推荐风格版
 
@@ -86,19 +93,54 @@ class PromptGenerator:
             rule_card: 规则卡字典（RuleCard.model_dump() 的结果）
             target_product: 目标产品类型（如 "毛毯"、"抱枕"）
             library_recommendations: 可选，自有图库推荐的参考图列表
+            num_directions: 推荐几套方案（三期阶段三）。1（默认）= 原有单套路径，
+                            返回形状与改造前**完全一致**；>1 返回
+                            `{"directions": [套1, 套2, ...], "num_directions": N}`。
 
         返回:
-            包含锁定核心、推荐改动、提示词等的完整结果字典
+            num_directions == 1: 包含锁定核心、推荐改动、提示词等的完整结果字典（旧形状）
+            num_directions > 1:  {"directions": [...], "num_directions": N}
         """
         # 提取核心数据
-        layer_0 = rule_card.get("layer_0_core", {})
-        layer_2 = rule_card.get("layer_2_visual", {})
         layer_3 = rule_card.get("layer_3_variable", {})
         layer_4 = rule_card.get("layer_4_product", {})
 
-        locked_core = layer_0.get("core_selling_point", "")
+        # 产品适配规则：多套方案共用同一份，只算一次
+        adaptation = self._get_adaptation(layer_4, target_product)
 
-        # 根据是否有 AI 客户端，选择推荐方式
+        # ── 三期阶段三：多方案路径 ──
+        if num_directions > 1:
+            if self.ai_client:
+                multi = await self._ai_recommend_multi(
+                    rule_card, target_product, num_directions
+                )
+                recommendations = multi.get("recommendations", [])
+                # AI 顶层 slots 缺失时传 None 走规则卡兜底（与单套 R4 语义一致）
+                slots_raw = multi.get("customization_slots")
+            else:
+                recommendations = self._random_recommend_multi(
+                    layer_3, target_product, num_directions
+                )
+                slots_raw = None
+
+            # 可定制项与"选哪套方案"无关，只算一份塞进每套结果
+            # （PromptDisplay 无需改动即可展示可定制项）
+            customization_slots = self._extract_customization_slots(rule_card, slots_raw)
+
+            directions = [
+                self._assemble_version_b_direction(
+                    rule_card=rule_card,
+                    recommended=rec,
+                    customization_slots=customization_slots,
+                    adaptation=adaptation,
+                    target_product=target_product,
+                    library_recommendations=library_recommendations,
+                )
+                for rec in recommendations
+            ]
+            return {"directions": directions, "num_directions": len(directions)}
+
+        # ── 单套路径（默认，行为与改造前等价）──
         if self.ai_client:
             # AI 推荐模式
             recommended = await self._ai_recommend(rule_card, target_product)
@@ -106,17 +148,47 @@ class PromptGenerator:
             # 随机推荐模式：从 alternatives 取第一个
             recommended = self._random_recommend(layer_3, target_product)
 
-        recommended_changes = recommended.get("recommended_changes", {})
-        reason = recommended.get("reason", "随机选取替代方案")
-
         # R4：提取可定制项。传 None（字段缺失，如随机模式/AI降级）走规则卡兜底；
         # AI 显式返回 [] 表示"无可定制项"则尊重，不兜底。故不设默认 []，缺失传 None。
         customization_slots = self._extract_customization_slots(
             rule_card, recommended.get("customization_slots")
         )
 
-        # 获取产品适配规则
-        adaptation = self._get_adaptation(layer_4, target_product)
+        return self._assemble_version_b_direction(
+            rule_card=rule_card,
+            recommended=recommended,
+            customization_slots=customization_slots,
+            adaptation=adaptation,
+            target_product=target_product,
+            library_recommendations=library_recommendations,
+        )
+
+    def _assemble_version_b_direction(
+        self,
+        rule_card: dict,
+        recommended: dict,
+        customization_slots: list,
+        adaptation: dict,
+        target_product: str,
+        library_recommendations: Optional[List[dict]] = None,
+    ) -> dict:
+        """把一套推荐方案组装成版本B 的结果 dict（三期阶段三抽出的纯重构）。
+
+        单套路径与多方案路径共用这一份组装逻辑，保证两条路径产出的字段
+        **逐字段一致**（前端 PromptDisplay 直接消费，形状不能有差异）。
+
+        参数:
+            recommended: 一套推荐（含 recommended_changes/reason/三段英文描述/negative_elements）
+            customization_slots: 已经过 _extract_customization_slots 处理的可定制项列表
+            adaptation: 已算好的产品适配规则（多套共用，避免重复计算）
+        """
+        layer_0 = rule_card.get("layer_0_core", {})
+        layer_2 = rule_card.get("layer_2_visual", {})
+        layer_3 = rule_card.get("layer_3_variable", {})
+
+        locked_core = layer_0.get("core_selling_point", "")
+        recommended_changes = recommended.get("recommended_changes", {})
+        reason = recommended.get("reason", "随机选取替代方案")
 
         # 组装中文结构化提示词
         structured_prompt_cn = self._build_structured_prompt_cn(
@@ -836,6 +908,119 @@ class PromptGenerator:
             "negative_elements": [],
         }
 
+    async def _ai_recommend_multi(
+        self, rule_card: dict, target_product: str, num_directions: int
+    ) -> dict:
+        """三期阶段三：一次 AI 调用返回多套差异化改款方案。
+
+        参数:
+            num_directions: 期望的方案数（>1）
+
+        返回:
+            {"recommendations": List[dict], "customization_slots": Optional[list]}
+            —— recommendations 至少 1 项；AI 失败/无有效项时降级为随机轮转推荐。
+        """
+        rule_card_json = json.dumps(rule_card, ensure_ascii=False, indent=2)
+        system_prompt = get_recommendation_prompt(
+            rule_card_json, target_product, num_directions=num_directions
+        )
+        user_prompt = (
+            f"请基于规则卡为「{target_product}」推荐 {num_directions} 套彼此明显差异化的"
+            f"改款方案，严格按 JSON 格式输出。"
+        )
+
+        # 创意任务不传 temperature（#13 约定），保持多套方案的多样性
+        result = await self._call_ai_for_json(system_prompt, user_prompt)
+
+        layer_3 = rule_card.get("layer_3_variable", {})
+        if not result:
+            logging.warning(
+                "多方案推荐 AI 调用失败，降级为随机轮转推荐（期望 %d 套）", num_directions
+            )
+            return {
+                "recommendations": self._random_recommend_multi(
+                    layer_3, target_product, num_directions, degraded_note="AI 调用失败"
+                ),
+                "customization_slots": None,
+            }
+
+        raw_list = result.get("recommendations")
+        valid = []
+        if isinstance(raw_list, list):
+            for rec in raw_list:
+                # recommended_changes 必须是非空 dict，否则这套方案没有任何可用改动，丢弃
+                if isinstance(rec, dict) and isinstance(rec.get("recommended_changes"), dict) \
+                        and rec["recommended_changes"]:
+                    valid.append(rec)
+
+        if not valid:
+            logging.warning(
+                "多方案推荐 AI 返回格式异常（无有效方案），降级为随机轮转推荐（期望 %d 套）",
+                num_directions,
+            )
+            return {
+                "recommendations": self._random_recommend_multi(
+                    layer_3, target_product, num_directions, degraded_note="AI 返回格式异常"
+                ),
+                "customization_slots": result.get("customization_slots"),
+            }
+
+        if len(valid) < num_directions:
+            # 有效项不足也照常返回（不报错）——少几套方案仍然可用，
+            # 前端按实际条数渲染卡片
+            logging.warning(
+                "多方案推荐：AI 只返回了 %d 套有效方案（期望 %d 套）", len(valid), num_directions
+            )
+
+        return {
+            "recommendations": valid[:num_directions],
+            "customization_slots": result.get("customization_slots"),
+        }
+
+    def _random_recommend_multi(
+        self,
+        layer_3: dict,
+        target_product: str,
+        num_directions: int,
+        degraded_note: str = "",
+    ) -> List[dict]:
+        """三期阶段三：无 AI / AI 降级时的多方案推荐——轮转取 alternatives。
+
+        第 i 套方案的每个维度取 `alternatives[i % len(alternatives)]`
+        （空 alternatives 用 original）。只要某维度的 alternatives 数量 > 1，
+        各套方案就天然不同，不会给出 N 套一模一样的结果。
+
+        参数:
+            degraded_note: 非空时说明这是从 AI 降级来的，写进 reason 让用户知道
+        """
+        replaceable = layer_3.get("replaceable_elements", {})
+        results = []  # type: List[dict]
+
+        for i in range(num_directions):
+            recommended_changes = {}
+            for field_name, item in replaceable.items():
+                alternatives = item.get("alternatives", []) if isinstance(item, dict) else []
+                if alternatives:
+                    recommended_changes[field_name] = alternatives[i % len(alternatives)]
+                else:
+                    recommended_changes[field_name] = (
+                        item.get("original", "") if isinstance(item, dict) else ""
+                    )
+            prefix = f"{degraded_note}，已降级为" if degraded_note else ""
+            results.append({
+                "recommended_changes": recommended_changes,
+                "reason": (
+                    f"{prefix}随机轮转推荐（第 {i + 1} 套）：为每个可替换维度选取了第 "
+                    f"{i + 1} 个候选替代方案，适配「{target_product}」产品"
+                ),
+                "style_description": "",
+                "color_description": "",
+                "layout_description": "",
+                "negative_elements": [],
+            })
+
+        return results
+
     def _parse_is_text_slot(self, raw) -> bool:
         """R4：解析 is_text_slot 字段为布尔值。
 
@@ -1513,3 +1698,383 @@ class PromptGenerator:
         if "日期" in dim_lower or "date" in dim_lower:
             return "2026"
         return "NAME"
+
+
+# ==================== 元素拆分图（三期阶段四） ====================
+
+def _parse_is_text_slot_value(raw) -> bool:
+    """解析 is_text_slot 字段为布尔值（模块级版本，供 extract_element_list 用）。
+
+    与 PromptGenerator._parse_is_text_slot 同一套判定：LLM 常返回字符串
+    "true"/"false" 而非布尔，`bool("false") == True` 会误判，故字符串按内容判断。
+    """
+    if isinstance(raw, str):
+        return raw.strip().lower() == "true"
+    return bool(raw)
+
+
+def _element_value_for_prompt(raw: str, en: Optional[str] = None) -> str:
+    """取元素描述的抠取指令用值：优先英文，取不到则**放行原始中文**。
+
+    与 _append_english（英文生图提示词，含中文就丢弃）的策略刚好相反，
+    与批次四 _edit_lang_value 一致——抠取指令会连同竞品原图一起发给生图模型，
+    中文只是用来定位"图里的哪个东西"，不是要求模型画出中文字，所以不丢弃。
+    （CLAUDE.md 铁律 §2-10）
+    """
+    if en and isinstance(en, str) and en.strip():
+        return en.strip()
+    return (raw or "").strip()
+
+
+# 抽象属性类维度名关键词——这类维度描述的是"整体怎么画"（风格/配色/氛围），
+# 不是画面里可以单独抠出来的物件。实测把"柔和水彩""粉白绿棕（女孩感）""通用"
+# 送进抠取指令，模型只能凭空编一张图，纯属白烧钱，所以在清单阶段就排除。
+_ABSTRACT_DIMENSION_KEYWORDS = (
+    "色彩", "配色", "颜色", "色调", "风格", "画风", "氛围", "情绪", "场景切换",
+    "构图", "排版", "布局", "比例", "质感", "色系",
+    "color", "palette", "style", "mood", "atmosphere", "layout", "composition",
+)
+
+
+# 文字位判断的关键词兜底——与 _get_pod_hints 的 text_keywords 同一份清单。
+# 旧规则卡（VLM 分析阶段还没有 is_text_slot 字段）里所有元素的 is_text_slot 都缺失，
+# 只靠该字段会把"名字/日期"这类文字位当成普通图案元素（排序不对、默认勾选不对）。
+_TEXT_SLOT_KEYWORDS = ("标题", "文案", "名字", "名称", "短句", "日期",
+                       "title", "text", "name", "slogan", "date")
+
+# 纯色底/空白底的描述特征——这类"背景"抠出来就是一张纯色图，没有素材价值。
+# 注意只能按**值**判断，不能按维度名判断："背景光效='Top underwater sun rays'"
+# 这种名字里带"背景"但值是真实可抠元素（光束）的维度必须保留。
+_PLAIN_BACKGROUND_VALUE_KEYWORDS = (
+    "纯白", "纯色", "干净底", "空白", "留白", "单色",
+    "plain white", "solid color", "solid white", "blank", "clean background",
+    "plain background", "white background",
+)
+
+
+def _looks_like_text_slot(name: str, value: str, explicit) -> bool:
+    """判断是否文字槽位：显式 is_text_slot 字段优先，缺失时按关键词兜底。
+
+    与 _get_pod_hints 同款策略（新卡走字段、旧卡走关键词），保证同一张规则卡
+    在"生图提示词的文字位处理"和"元素拆分清单"两处的判断一致。
+    """
+    if explicit is not None:
+        return _parse_is_text_slot_value(explicit)
+    blob = f"{name} {value}".lower()
+    return any(k in blob for k in _TEXT_SLOT_KEYWORDS)
+
+
+def _is_abstract_dimension(name: str, value: str) -> bool:
+    """判断一个维度是否属于"抽象属性"（不可抠取）。
+
+    只看维度名（name_cn）——它是 VLM 给的维度标签，比自由文本的值更稳定。
+    值为空或极短的无意义占位（如"通用"）也排除。
+    """
+    low = (name or "").lower()
+    if any(k in low for k in _ABSTRACT_DIMENSION_KEYWORDS):
+        return True
+    # 纯色/空白底：抠出来就是一张纯色图，没有素材价值。按值判断而非按名判断，
+    # 避免误伤"背景光效='水下阳光光束'"这类名字带"背景"但确实可抠的元素
+    val_low = (value or "").lower()
+    if any(k in val_low for k in _PLAIN_BACKGROUND_VALUE_KEYWORDS):
+        return True
+    # 值是"通用/无/默认"这类占位，抠不出东西
+    return (value or "").strip() in ("通用", "无", "默认", "N/A", "none")
+
+
+# 词级重叠去重的停用词（英文描述里的虚词/修饰词，不参与语义比较）
+_DEDUP_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "with", "as", "from",
+    "to", "is", "are", "its", "it", "that", "this", "for", "by", "into",
+    "around", "above", "below", "tones", "effect", "element", "elements",
+}
+
+
+def _semantic_words(text: str) -> set:
+    """把描述切成用于比较的实词集合（小写、去停用词、粗糙去复数）。"""
+    import re
+    result = set()
+    for w in re.findall(r"[a-zA-Z]+", (text or "").lower()):
+        if w in _DEDUP_STOPWORDS or len(w) <= 2:
+            continue
+        # 粗糙去复数：reefs→reef、schools→school（长度>3 才削，避免 "sea"→"se"）
+        result.add(w[:-1] if w.endswith("s") and len(w) > 3 else w)
+    return result
+
+
+def _cn_name_overlaps(name: str, existing_names: List[str]) -> bool:
+    """中文维度名判重：第2层与第3层描述同一个位置时，**英文措辞可能毫无重叠**，
+    词级判重挡不住，但中文维度名往往共享核心词。
+
+    实测案例：第3层 `宠物类型='Golden retriever'` 与第2层
+    `主体宠物肖像区='A front-facing half-body portrait of a single pet...'`
+    是画面同一个位置，英文实词交集为空（品种名 vs 构图描述），
+    但中文名都含"宠物"。同理 `爪印符号` 与 `爪印符号区`。
+
+    判定：去掉常见的结构性后缀词（区/位/层/框/型/类型）后，
+    若一方的核心名是另一方的子串，视为同一位置。
+    """
+    def core(n: str) -> str:
+        out = (n or "").strip()
+        for suffix in ("区域", "区", "位置", "位", "层", "边框", "框", "类型", "型", "主体", "符号"):
+            out = out.replace(suffix, "")
+        return out
+    c = core(name)
+    if len(c) < 2:          # 核心名太短（如"花"）容易误伤，放弃判重
+        return False
+    for other in existing_names:
+        o = core(other)
+        if len(o) < 2:
+            continue
+        if c in o or o in c:
+            return True
+    return False
+
+
+def _is_semantic_duplicate(candidate: str, existing: List[str], threshold: float = 0.7) -> bool:
+    """词级重叠判重：候选描述与任一已收集描述的实词重叠率 >= threshold 即视为同一元素。
+
+    为什么需要这道防线：同一个元素在第2/3层常被描述成不同措辞，子串匹配挡不住——
+    实测 `尾巴造型='Glowing blue-green scaled tail'`（第3层）与
+    `人鱼尾巴='A long scaled mermaid tail in blue-green tones...'`（第2层）
+    没有子串包含关系，但显然是同一条尾巴。重叠率按**较短一方**计算
+    （第2层描述通常长得多，按长的算会永远达不到阈值）。
+
+    实测阈值 0.7 能把 4 组真重复（重叠率 100%）与 2 组不同元素
+    （40% / 0%，如"鱼群+水母+海龟"整组 vs 单独的"左下角海龟"）分开。
+    """
+    cand = _semantic_words(candidate)
+    if not cand:
+        return False
+    for other in existing:
+        ow = _semantic_words(other)
+        if not ow:
+            continue
+        short, long_ = (cand, ow) if len(cand) <= len(ow) else (ow, cand)
+        if len(short & long_) / len(short) >= threshold:
+            return True
+    return False
+
+
+def extract_element_list(rule_card: dict) -> List[dict]:
+    """从规则卡提取"可拆分元素"清单（三期阶段四）。
+
+    数据来自两层，且这两层**经常记录同一个元素**（第3层记 `犬种名称='Dachshund'`、
+    第2层记 `主题文字区='大号手写体主题文字，当前为"Dachshund"'`），所以沿用
+    `_get_pod_hints` 已验证过的两道去重防线，否则同一元素会被抠两次、白烧两次钱。
+
+    参数:
+        rule_card: 规则卡字典
+
+    返回:
+        List[dict]，每项含 element_key / name_cn / value_cn / value_for_prompt /
+        position / is_text_slot / extraction_prompt。非文字位在前，文字位排最后。
+    """
+    layer_2 = rule_card.get("layer_2_visual", {}) or {}
+    layer_3 = rule_card.get("layer_3_variable", {}) or {}
+    replaceable = layer_3.get("replaceable_elements", {}) or {}
+    must_have = layer_2.get("must_have_elements", []) or []
+
+    items = []  # type: List[dict]
+
+    # ── 1. 第3层可替换元素 ──
+    for dim, item in replaceable.items():
+        if not isinstance(item, dict):
+            continue
+        value_cn = (item.get("original") or "").strip()
+        value_for_prompt = _element_value_for_prompt(value_cn, item.get("original_en"))
+        if not value_for_prompt:
+            continue
+        # 抽象属性（风格/配色/氛围）抠不出实体，直接排除，别浪费调用
+        if _is_abstract_dimension(dim, value_cn):
+            continue
+        items.append({
+            "element_key": f"L3::{dim}",
+            "name_cn": dim,
+            "value_cn": value_cn,
+            "value_for_prompt": value_for_prompt,
+            "position": "",
+            "is_text_slot": _looks_like_text_slot(dim, value_cn, item.get("is_text_slot")),
+            "_raw": item,   # 原始层数据，_build_element_variants 要读 alternatives
+        })
+
+    # ── 2. 第2层必备元素（去重防线①：语义去重）──
+    collected_names = {i["name_cn"] for i in items}
+    collected_values = {i["value_cn"] for i in items if i["value_cn"]} | \
+                       {i["value_for_prompt"] for i in items if i["value_for_prompt"]}
+    for el in must_have:
+        if not isinstance(el, dict):
+            continue
+        slot = (el.get("slot") or "").strip()
+        desc = (el.get("description") or "").strip()
+        # 防线①-a：槽位名与第3层维度同名 → 同一元素
+        if slot and slot in collected_names:
+            continue
+        # 防线①-b：描述里包含任一已收集的元素值 → 同一元素的两次记录
+        #（第2层描述常写成"…，当前为'xxx'"，xxx 正是第3层的 original）
+        if desc and any(v and v in desc for v in collected_values):
+            continue
+        value_for_prompt = _element_value_for_prompt(desc, el.get("description_en"))
+        if not value_for_prompt:
+            continue
+        if _is_abstract_dimension(slot, desc):
+            continue
+        # 防线①-c：词级重叠判重——措辞不同但说的是同一元素（如"尾巴造型"vs"人鱼尾巴"），
+        # 子串匹配挡不住，必须比实词重叠率
+        if _is_semantic_duplicate(value_for_prompt, [i["value_for_prompt"] for i in items]):
+            continue
+        # 防线①-d：中文维度名判重——第2层的"主体宠物肖像区"与第3层的"宠物类型"
+        # 是同一个位置，但英文措辞（构图描述 vs 品种名）实词交集为空，①-c 挡不住。
+        # 这类漏判的后果比多抠一张更严重：第2层项没有 alternatives，会在界面上
+        # 多出一个"只有 1 个候选"的重复维度，干扰用户勾选。
+        if _cn_name_overlaps(slot, [i["name_cn"] for i in items]):
+            continue
+        items.append({
+            "element_key": f"L2::{slot or value_for_prompt[:20]}",
+            "name_cn": slot or desc[:20],
+            "value_cn": desc,
+            "value_for_prompt": value_for_prompt,
+            "position": (el.get("position") or "").strip(),
+            "is_text_slot": _looks_like_text_slot(slot, desc, el.get("is_text_slot")),
+            "_raw": el,     # 第2层元素没有 alternatives，variants 只会有原始项
+        })
+
+    # ── 3. 去重防线②：全列表按 value_for_prompt 保序去重 ──
+    seen = set()
+    deduped = []  # type: List[dict]
+    for i in items:
+        key = i["value_for_prompt"]
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(i)
+
+    # ── 4. 只保留图形元素，剔除全部文字类（2026-08-17 用户确认的口径）──
+    # 用户要的是"图中的构建元素"——猫/花卉/彩虹/云朵/边框/图标这些看得见的图形。
+    # 文字类（名字 Luna、年份 2011-2026、纪念文案，以及"名字文字区"这类描述位）
+    # 抠出来只是一段字，没有素材价值，且抠字极易糊，所以直接不进清单。
+    # 仍然保留 is_text_slot 字段的解析（上面 _looks_like_text_slot），因为它就是这里
+    # 的过滤依据——旧规则卡没有该字段，全靠关键词兜底才能认出文字位。
+    deduped = [i for i in deduped if not i["is_text_slot"]]
+
+    # ── 5. 生成抠取指令 ──
+    # 模板需要两个填充：目标元素 + **要擦掉的其余元素点名清单**。
+    # 为什么要点名：只写 "Erase every other element" 时模型不敢删主体——实测抠
+    # "彩虹拱门"时花卉/文字/云朵都擦干净了、猫却完整留着（用户实测反馈）。
+    # 排除清单要用**全部**元素（含被上面过滤掉的文字位），因为文字也得擦；
+    # 所以这里从 all_names 里排掉当前目标，而不是从 deduped 里排。
+    all_labels = []
+    for dim, item in replaceable.items():
+        if isinstance(item, dict):
+            label = _element_value_for_prompt(item.get("original", ""), item.get("original_en"))
+            if label:
+                all_labels.append(label)
+    for el in must_have:
+        if isinstance(el, dict):
+            label = _element_value_for_prompt(
+                el.get("description", ""), el.get("description_en")
+            )
+            if label:
+                all_labels.append(label)
+
+    for i in deduped:
+        # 目标元素也用短标签：完整长句会在模板里重复三次（keep ONLY / must stay /
+        # must contain），冗长反而稀释指令强度
+        target = _shorten_label(i["value_for_prompt"], max_words=10)
+        # 排掉目标自己，以及与目标高度重叠的表述（同一元素的另一种措辞——
+        # 复用词级重叠判重，否则会出现"擦掉 X"与"保留 X"自相矛盾的指令）
+        others = []
+        seen_o = set()
+        for label in all_labels:
+            if label == target or label in seen_o:
+                continue
+            if _is_semantic_duplicate(label, [target]):
+                continue
+            seen_o.add(label)
+            others.append(_shorten_label(label))
+        # 兜底：万一算不出其余元素（单元素规则卡），退回泛化表述
+        others_text = "; ".join(others) if others else "every other object and decoration"
+        i["extraction_prompt"] = ELEMENT_EXTRACTION_PROMPT_TEMPLATE.format(
+            element=target, others=others_text
+        )
+        # 2026-08-17 用户澄清：真正要的是"这个维度下拉框里的**每个候选变体**都出一张"，
+        # 所以每个元素带一份 variants 清单——第 0 项是原始值（走擦除指令，图里本来就有），
+        # 其余是 alternatives（走替换指令，图里没有需要换出来）。
+        i["variants"] = _build_element_variants(i, others_text)
+
+    return deduped
+
+
+def _build_element_variants(item: dict, others_text: str) -> List[dict]:
+    """为一个元素构造"候选变体"清单：原始值 + 各 alternatives，每项自带生成指令。
+
+    参数:
+        item: extract_element_list 收集到的元素条目（需含 _raw 原始层数据）
+        others_text: 该元素对应的"要擦掉的其余元素"点名清单（与擦除指令共用）
+
+    返回:
+        List[dict]，每项 {variant_key, label_cn, label_for_prompt, is_original, prompt}
+        —— 原始项 is_original=True 用擦除指令，其余用替换指令。
+    """
+    raw = item.get("_raw") or {}
+    target = item["value_for_prompt"]
+    # element_role：告诉模型"要换的是画面里的哪个角色位"，用元素的短标签
+    element_role = _shorten_label(target, max_words=8)
+    # pose_clause：姿态/构图约束。只有当规则卡对该元素有**成句的形态描述**时才加——
+    # 第3层的 value_cn 常常就是个短标签（"金毛犬"），拿它当姿态说明毫无信息量，
+    # 反而占位、还可能把中文标签重复一遍。所以要求：有英文描述、且明显长于标签。
+    desc_en = raw.get("description_en") or ""
+    pose_clause = ""
+    if isinstance(desc_en, str) and len(desc_en.split()) >= 4:
+        pose = _shorten_label(desc_en, max_words=14)
+        if pose and pose.lower() != element_role.lower():
+            pose_clause = f" (keep the same pose and composition: {pose})"
+
+    variants = [{
+        "variant_key": f"{item['element_key']}::original",
+        "label_cn": item.get("value_cn") or target,
+        "label_for_prompt": target,
+        "is_original": True,
+        "prompt": item["extraction_prompt"],
+    }]
+
+    alts = raw.get("alternatives") or []
+    alts_en = raw.get("alternatives_en") or []
+    for idx, alt in enumerate(alts):
+        if not isinstance(alt, str) or not alt.strip():
+            continue
+        alt_cn = alt.strip()
+        # 英文优先（索引对齐 alternatives_en），取不到放行中文
+        alt_en = ""
+        if idx < len(alts_en) and isinstance(alts_en[idx], str):
+            alt_en = alts_en[idx].strip()
+        label_for_prompt = alt_en or alt_cn
+        variants.append({
+            "variant_key": f"{item['element_key']}::alt{idx}",
+            "label_cn": alt_cn,
+            "label_for_prompt": label_for_prompt,
+            "is_original": False,
+            "prompt": ELEMENT_VARIANT_PROMPT_TEMPLATE.format(
+                element_role=element_role,
+                variant=label_for_prompt,
+                pose_clause=pose_clause,
+                others=others_text,
+            ),
+        })
+    return variants
+
+
+def _shorten_label(label: str, max_words: int = 8) -> str:
+    """把长描述截短成"点名用"的短语。
+
+    第2层的描述常是整句（"A semicircular rainbow behind the pet's head, creating a
+    sense of protection and embrace."），整句塞进排除清单会让 prompt 冗长且互相干扰；
+    取前几个词足够让模型认出是哪个元素。按逗号先断句，再限词数。
+    """
+    text = (label or "").strip().rstrip(".")
+    if "," in text:
+        text = text.split(",")[0].strip()
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    return text

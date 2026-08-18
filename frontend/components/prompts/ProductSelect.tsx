@@ -9,10 +9,15 @@
  *
  * PromptVersionA / PromptVersionB 共用同一份"从 ruleCard 取产品下拉项"逻辑，
  * 之前两处重复维护，这里统一成一个组件。
+ *
+ * 三期阶段一：自定义输入过的产品名会持久化到后端（lib/userPrefs.ts），
+ * 下次打开任何规则卡都直接出现在下拉框里（带 ✏️ 前缀），不用重新打字；
+ * 自定义输入模式下可以在 chips 区删除不再需要的。
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Select from '@/components/ui/Select';
+import { fetchPrefs, removeCustomProduct, getCachedPrefs } from '@/lib/userPrefs';
 
 const CUSTOM_VALUE = '__custom_product__';
 
@@ -50,6 +55,31 @@ export default function ProductSelect({
 }: ProductSelectProps) {
   /* 是否处于自定义文本输入模式 */
   const [customMode, setCustomMode] = useState(false);
+  /* 三期阶段一：后端持久化的自定义产品名。懒初始化直接读模块缓存——
+   * A/B/C 三个实例中后挂载的那些可以立即拿到值，不用等 effect 跑完再闪一下。 */
+  const [savedProducts, setSavedProducts] = useState<string[]>(
+    () => getCachedPrefs()?.custom_products ?? []
+  );
+
+  /* 挂载时拉一次偏好（模块级缓存 + 并发去重，三个实例只发一次请求）。
+   * 失败时 fetchPrefs 内部已静默降级为空数组，这里不用额外 catch。 */
+  useEffect(() => {
+    let cancelled = false;
+    fetchPrefs().then((prefs) => {
+      if (!cancelled) setSavedProducts(prefs.custom_products);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  /* 已保存产品里排除掉规则卡本身就有的项（避免同名重复出现两次） */
+  const knownValues = new Set(options.map((o) => o.value));
+  const extraSavedProducts = savedProducts.filter((p) => !knownValues.has(p));
+
+  /* 删除一条已保存的自定义产品 */
+  const handleRemoveSaved = async (name: string) => {
+    const list = await removeCustomProduct(name);
+    setSavedProducts(list);
+  };
 
   const handleSelectChange = (val: string) => {
     if (val === CUSTOM_VALUE) {
@@ -63,6 +93,12 @@ export default function ProductSelect({
   const handleRestoreSelect = () => {
     setCustomMode(false);
     onChange('');
+  };
+
+  /* 点击 chip：选中该产品并退回下拉模式（下拉里已合并了这些已保存项，能正常选中显示） */
+  const handlePickSaved = (name: string) => {
+    setCustomMode(false);
+    onChange(name);
   };
 
   if (customMode) {
@@ -99,8 +135,45 @@ export default function ProductSelect({
             ↩ 恢复下拉
           </button>
         </div>
+
+        {/* 三期阶段一：已保存的自定义产品 chips —— 点选直接用，× 删除 */}
+        {extraSavedProducts.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-[11px] font-mono text-codex-text-secondary">已保存的自定义产品：</p>
+            <div className="flex flex-wrap gap-1.5">
+              {extraSavedProducts.map((name) => (
+                <span
+                  key={name}
+                  className="
+                    inline-flex items-center gap-1 px-2 py-0.5
+                    text-[11px] font-mono rounded
+                    bg-codex-bg text-codex-text
+                    border border-codex-border
+                  "
+                >
+                  <button
+                    onClick={() => handlePickSaved(name)}
+                    className="hover:text-codex-accent transition-colors cursor-pointer"
+                    title="使用这个产品"
+                  >
+                    {name}
+                  </button>
+                  <button
+                    onClick={() => handleRemoveSaved(name)}
+                    className="text-codex-text-secondary hover:text-codex-danger transition-colors cursor-pointer"
+                    title="删除这个已保存的产品"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
         <p className="text-[11px] font-mono text-codex-text-secondary">
-          💡 AI 识别的产品列表不准确时（比如竞品图实际是相框却没列出来），可以在这里手动填写
+          💡 AI 识别的产品列表不准确时（比如竞品图实际是相框却没列出来），可以在这里手动填写；
+          生成后会自动保存，下次在任何规则卡的下拉框里都能直接选
         </p>
       </div>
     );
@@ -112,6 +185,8 @@ export default function ProductSelect({
       options={[
         { label: '— 请选择目标产品 —', value: '' },
         ...options,
+        /* 三期阶段一：已保存的自定义产品，带 ✏️ 前缀与规则卡自带项区分（value 用原始产品名） */
+        ...extraSavedProducts.map((p) => ({ label: `✏️ ${p}`, value: p })),
         { label: '✏️ 自定义...', value: CUSTOM_VALUE },
       ]}
       value={value}

@@ -19,6 +19,7 @@ import Card from '@/components/ui/Card';
 import PromptDisplay, { PromptResult } from '@/components/prompts/PromptDisplay';
 import CollapsibleSection from '@/components/ui/CollapsibleSection';
 import Link from 'next/link';
+import { addCustomProductIfNew } from '@/lib/userPrefs';
 
 /* 二期批次一：界面精简开关，改 true 恢复显示 */
 const SHOW_INFO_CARDS = false;
@@ -163,6 +164,9 @@ export default function PromptVersionA({ ruleId, ruleCard }: PromptVersionAProps
       setError('请选择目标产品');
       return;
     }
+
+    /* 三期阶段一：手填的自定义产品名落后端持久化，下次任何规则卡都能直接选（fire-and-forget） */
+    addCustomProductIfNew(targetProduct, productOptions.map((o) => o.value));
 
     setLoading(true);
     setError('');

@@ -7,19 +7,25 @@
 - GET  /api/gen/task/{task_id} → 查询任务状态
 - GET  /api/gen/tasks          → 任务列表
 - POST /api/gen/download/{task_id} → 下载远端图片到本地
+- POST /api/gen/download-zip   → 批量打包下载（裸 zip 二进制，非包装格式）
 - POST /api/gen/analyze-ref    → 上传参考图，AI 分析提取单一维度特征片段
 """
 
 import asyncio
+import base64
+import io
 import logging
 import json
 import re
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from models.image_gen import (
     ImageGenConfig,
@@ -39,6 +45,7 @@ from services.image_gen_store import (
     GEN_TASKS_DIR,
 )
 from services.image_format_utils import prepare_image_for_vlm, UPLOAD_ACCEPTED_MIME_TYPES
+from services.image_alpha_utils import white_to_transparent
 from services.ai_client import load_ai_client_from_config
 from services.ai_response_utils import extract_json_from_ai_response
 from services.rule_store import get_rule
@@ -76,6 +83,37 @@ def _resolve_reference_path(url_path: str) -> Optional[Path]:
                 return resolved
             return None
     return None
+
+def _convert_data_uri_to_transparent(url: str) -> str:
+    """把白底图的 data URI 转成透明底 data URI（元素拆分专用）。
+
+    只处理 data URI（OpenAI 同步模式返回的形式）；http URL 原样返回——
+    远端 URL 要先下载才能改，那条路径（AIReiter 异步）本来就不支持带参考图、
+    走不到元素拆分，不为它增加复杂度。
+
+    转换失败/不是 data URI 时**原样返回**，绝不让它阻断生图流程。
+    """
+    if not url.startswith("data:"):
+        return url
+    try:
+        header, b64data = url.split(",", 1)
+        raw = base64.b64decode(b64data)
+        converted, stats = white_to_transparent(raw)
+        if not stats.get("converted"):
+            if stats.get("error"):
+                logging.warning("元素拆分转透明失败，保留白底图：%s", stats["error"])
+            return url
+        logging.info(
+            "元素拆分转透明完成：全透明 %.1f%% / 半透明 %.1f%% / 包围盒 %s",
+            stats.get("transparent_ratio", 0) * 100,
+            stats.get("semi_ratio", 0) * 100,
+            stats.get("bbox"),
+        )
+        return "data:image/png;base64," + base64.b64encode(converted).decode()
+    except Exception:
+        logging.warning("元素拆分转透明异常，保留白底图", exc_info=True)
+        return url
+
 
 # 生图配置文件路径（和 AI 分析配置分开存）
 GEN_CONFIG_PATH = DATA_DIR / "gen_config.json"
@@ -277,6 +315,15 @@ async def submit_gen_task(request: ImageGenRequest):
                 reference_images=reference_images,
             )
             is_sync_completed = result.get("status") == "completed" and result.get("image_urls")
+
+            # 2026-08-17（元素拆分图）：白底 → 真透明底。
+            # **只对 version='E'（元素拆分）做**——普通 POD 设计图的白底是设计的一部分，
+            # 绝不能被扒掉。抠取指令必须出白底（透明底与"保持原位置"不可兼得，见
+            # ELEMENT_EXTRACTION_PROMPT_TEMPLATE 的注释），所以在这里补转换。
+            if request.version == "E" and is_sync_completed:
+                result["image_urls"] = [
+                    _convert_data_uri_to_transparent(u) for u in result["image_urls"]
+                ]
             # #17：OpenAI 同步模式 _openai_generate 恒返 "completed"，无图说明 API 调用成功但未出图
             # （内容策略拒绝/配额耗尽），判 failed，不落僵尸 completed。AIReiter 不受影响。
             is_openai_no_image = (
@@ -482,6 +529,73 @@ async def download_gen_images(task_id: str):
         "local_paths": downloaded,
         "accessible_paths": accessible_paths,
     }
+
+
+# 单次打包上限：每张图 1~2MB，20 张约 20~40MB，再多会让响应体过大且等待过久
+_MAX_ZIP_TASKS = 20
+
+
+class DownloadZipRequest(BaseModel):
+    """批量打包下载请求（三期阶段四）"""
+    task_ids: List[str] = Field(description="要打包的任务 ID 列表")
+
+
+@router.post("/download-zip")
+async def download_gen_images_zip(request: DownloadZipRequest):
+    """把多个任务的图片打成一个 zip 返回（三期阶段四：元素拆分图批量下载）。
+
+    ⚠️ **这个端点返回裸 zip 二进制，不走 {"success":..., "data":...} 包装格式**
+    ——下载类端点的既定例外（同 GET 静态文件）。前端**不能用 apiPost**
+    （它会 `response.json()` 直接崩），必须用原生 fetch 取 `res.blob()`。
+
+    幂等：已下载过的任务复用 task.local_images，不重复拉取远端。
+    单个任务失败（不存在/未完成/下载失败）跳过不中断，最终一张都没有才报 400。
+    """
+    task_ids = request.task_ids
+    if not task_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个任务")
+    if len(task_ids) > _MAX_ZIP_TASKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次最多打包 {_MAX_ZIP_TASKS} 个任务（本次 {len(task_ids)} 个）",
+        )
+
+    collected = []  # type: List[tuple]
+    for tid in task_ids:
+        task = get_task(tid)
+        if task is None:
+            logging.warning("打包下载跳过：任务 %s 不存在", tid)
+            continue
+        paths = list(task.local_images or [])
+        if not paths:
+            # 还没下载过 → 现在下载（download_images 已支持 data URI 落盘）
+            try:
+                paths = await download_images(tid)
+            except Exception:
+                logging.warning("打包下载跳过：任务 %s 下载失败", tid, exc_info=True)
+                continue
+        for p in paths:
+            fp = Path(p)
+            if fp.exists():
+                collected.append((tid, fp))
+
+    if not collected:
+        raise HTTPException(status_code=400, detail="没有可下载的图片")
+
+    # ZIP_STORED（不压缩）：图片本身已是压缩格式，再压几乎不减体积却明显更慢
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for tid, fp in collected:
+            # zip 内文件名带 task_id 前缀，防不同任务的同名文件互相覆盖
+            zf.write(str(fp), arcname=f"{tid}_{fp.name}")
+    buf.seek(0)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=split_elements_{stamp}.zip"},
+    )
 
 
 # ==================== 参考图分析 ====================

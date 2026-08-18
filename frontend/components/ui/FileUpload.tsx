@@ -5,20 +5,32 @@
  * 支持拖拽上传、点击选择、剪贴板粘贴（Ctrl+V / Cmd+V）上传
  * 选择文件后显示预览缩略图
  * Codex 深色风格
+ *
+ * 三期阶段二：新增可选的多选模式（multiple + onFilesSelect）。
+ * 不传 multiple 时行为与改造前完全一致（单文件 onFileSelect + 预览缩略图），
+ * 所以 PromptDisplay 的"添加参考图"不受影响。
  */
 
 import { useRef, useState, useCallback, useEffect } from 'react';
 
 interface FileUploadProps {
-  onFileSelect: (file: File) => void;
+  /** 单文件回调。multiple 模式下不调用（改走 onFilesSelect） */
+  onFileSelect?: (file: File) => void;
   accept?: string;
   uploading?: boolean;
+  /** 三期阶段二：开启多选（input multiple + 拖拽收集全部图片） */
+  multiple?: boolean;
+  /** 三期阶段二：多选模式下的回调，收到本次选择的全部图片文件（只选 1 张也是长度 1 的数组，
+   *  由父组件决定单图/批量分流） */
+  onFilesSelect?: (files: File[]) => void;
 }
 
 export default function FileUpload({
   onFileSelect,
   accept = 'image/*',
   uploading = false,
+  multiple = false,
+  onFilesSelect,
 }: FileUploadProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -30,12 +42,28 @@ export default function FileUpload({
   /* 处理文件选择 */
   const handleFile = useCallback(
     (file: File) => {
+      /* 多选模式：交给 onFilesSelect（包装成单元素数组），不在组件内做预览——
+       * 批量场景的缩略图由父组件用网格展示，这里再显示一张会重复 */
+      if (multiple) {
+        onFilesSelect?.([file]);
+        return;
+      }
       /* 生成预览 URL */
       const url = URL.createObjectURL(file);
       setPreview(url);
-      onFileSelect(file);
+      onFileSelect?.(file);
     },
-    [onFileSelect]
+    [multiple, onFilesSelect, onFileSelect]
+  );
+
+  /* 多选模式：收集全部图片文件一次性回调（过滤非图片，防拖入 PDF/文本等） */
+  const handleFiles = useCallback(
+    (fileList: FileList) => {
+      const images = Array.from(fileList).filter((f) => f.type.startsWith('image/'));
+      if (images.length === 0) return;
+      onFilesSelect?.(images);
+    },
+    [onFilesSelect]
   );
 
   /* 点击触发文件选择 */
@@ -47,8 +75,15 @@ export default function FileUpload({
 
   /* input change 事件 */
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleFile(file);
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    if (multiple) {
+      handleFiles(files);
+      /* 清空 input value：不清的话再次选择同一批文件不会触发 change 事件 */
+      e.target.value = '';
+      return;
+    }
+    handleFile(files[0]);
   };
 
   /* 拖拽事件 */
@@ -68,8 +103,13 @@ export default function FileUpload({
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) handleFile(file);
+    const files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    if (multiple) {
+      handleFiles(files);
+      return;
+    }
+    handleFile(files[0]);
   };
 
   /*
@@ -128,11 +168,12 @@ export default function FileUpload({
         ref={inputRef}
         type="file"
         accept={accept}
+        multiple={multiple}
         onChange={handleChange}
         className="hidden"
       />
 
-      {/* 预览缩略图 */}
+      {/* 预览缩略图（多选模式不在此展示，由父组件用网格展示） */}
       {preview ? (
         <div className="flex flex-col items-center gap-3">
           <img
@@ -148,7 +189,9 @@ export default function FileUpload({
         <div className="flex flex-col items-center gap-3">
           <span className="text-4xl">📸</span>
           <p className="text-sm text-codex-text-secondary font-mono text-center">
-            拖拽图片到此处、点击选择，或按 Ctrl+V（Mac: ⌘+V）粘贴
+            {multiple
+              ? '支持一次选择/拖入多张图片，也可按 Ctrl+V（Mac: ⌘+V）粘贴'
+              : '拖拽图片到此处、点击选择，或按 Ctrl+V（Mac: ⌘+V）粘贴'}
           </p>
         </div>
       )}
