@@ -109,8 +109,13 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [zipping, setZipping] = useState(false);
   const [zipError, setZipError] = useState('');
-  /* 竞品原图宽高（后端随清单返回），按它请求画布保证比例 */
+  /* 竞品原图宽高（后端随清单返回），按它请求画布保证比例。
+   * 注意：后端已按 VLM 判断的"印刷图案朝向"校正过——竞品图常是实物摆拍
+   * （方形照片里拍竖条形灯笼面板），文件比例 ≠ 图案比例，见后端
+   * routers/prompts.py 的 _apply_orientation */
   const [sourceSize, setSourceSize] = useState<{ w: number; h: number } | null>(null);
+  /* 图案朝向（portrait/landscape/square），仅用于界面提示画布依据；空=旧规则卡未判断 */
+  const [artworkOrientation, setArtworkOrientation] = useState('');
 
   /* 权威队列在 ref 里——生成循环是跑几分钟的 async 函数，闭包读 state 是旧值
    * （同阶段二批量分析队列的做法，见 CLAUDE.md） */
@@ -147,10 +152,12 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
         elements: ElementFromApi[];
         source_width?: number;
         source_height?: number;
+        artwork_orientation?: string;
       }>(res);
       if (data?.source_width && data?.source_height) {
         setSourceSize({ w: data.source_width, h: data.source_height });
       }
+      setArtworkOrientation(data?.artwork_orientation || '');
       const els = data?.elements || [];
       setElements(els);
       /* 默认展开"有多个候选"的维度——那才是本功能的主场景；只有 1 个候选的收起 */
@@ -419,6 +426,21 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                 生成期间请勿关闭页面。
                 <br />
                 输出为<span className="font-bold">透明底 PNG</span>，同一维度下各变体的位置与姿态保持一致，可直接叠换。
+                {sourceSize && (
+                  <>
+                    <br />
+                    画布 {sourceSize.w}×{sourceSize.h}
+                    {artworkOrientation
+                      ? `（按 AI 判断的图案朝向：${
+                          artworkOrientation === 'portrait'
+                            ? '竖版'
+                            : artworkOrientation === 'landscape'
+                              ? '横版'
+                              : '方形'
+                        }）`
+                      : '（按竞品原图文件比例；此规则卡分析时未判断图案朝向，重新分析可校正实物摆拍图的比例）'}
+                  </>
+                )}
               </p>
             </div>
 

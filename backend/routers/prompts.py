@@ -8,7 +8,7 @@
 
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -200,6 +200,46 @@ async def generate_version_c(request: GenerateCRequest):
     }
 
 
+_VALID_ORIENTATIONS = ("portrait", "landscape", "square")
+
+
+def _get_artwork_orientation(rule) -> Optional[str]:
+    """从规则卡第 2 层取 VLM 判断的图案朝向，非法值一律当作没有。
+
+    只接受 portrait/landscape/square 三档（见 prompts/rule_extraction.py 的字段说明）。
+    旧规则卡没有这个字段返回 None，调用方回落到文件比例。
+    """
+    layer2 = getattr(rule, "layer_2_visual", None)
+    value = getattr(layer2, "artwork_orientation", None) if layer2 else None
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in _VALID_ORIENTATIONS:
+            return value
+    return None
+
+
+def _apply_orientation(width: int, height: int, orientation: Optional[str]):
+    """按图案朝向校正画布宽高：只重排长短边，不改变具体数值。
+
+    为什么只重排而不用 VLM 给的精确比例：VLM 估精确比例不可靠，而
+    `image_gen_client._get_openai_size` 本来只把宽高映射到 1:1 / 3:2 / 2:3
+    三个桶，朝向对了就够了。方图文件 + portrait 时没有短边可用（2000×2000
+    重排还是 2000×2000），此时按 2:3 构造竖版画布落进正确的桶。
+    """
+    if not orientation or width <= 0 or height <= 0:
+        return width, height
+
+    long_side, short_side = max(width, height), min(width, height)
+    if orientation == "square":
+        return long_side, long_side
+    if long_side == short_side:
+        # 方形文件里的竖/横图案：按 2:3 造出该朝向的画布
+        short_side = int(round(long_side * 2 / 3))
+    if orientation == "portrait":
+        return short_side, long_side
+    return long_side, short_side
+
+
 @router.get("/prompts/elements/{rule_id}")
 async def get_extractable_elements(rule_id: str):
     """元素拆分图：返回该规则卡可拆分的元素清单 + 每个元素的抠取指令（三期阶段四）。
@@ -234,6 +274,19 @@ async def get_extractable_elements(rule_id: str):
             # 读不到尺寸不影响清单本身可用，前端回落方图
             logging.warning("读取竞品原图尺寸失败 rule_id=%s", rule_id, exc_info=True)
 
+    # 2026-08-18：**文件比例 ≠ 图案比例**。竞品图常是实物摆拍——RULE-0063 是
+    # 2000×2000 的方形照片，但拍的是户外灯笼，真正的印刷图案是灯笼面板上约 1:2.2 的
+    # 窄竖条，四周全是灯具外壳与草地背景。按文件比例请求方形画布，图案必然被挤扁、
+    # 位置全错（用户反馈"元素比例应基于图案而非上传图"）。
+    #
+    # 所以优先用 VLM 判断的 `artwork_orientation`（第 2 层，只有三档粗分类——精确比例
+    # VLM 给不准，且 `_get_openai_size` 本来只有 1:1 / 3:2 / 2:3 三个桶，粗分类够用）
+    # 校正朝向：朝向与文件不一致时，把文件的长短边按该朝向重排。旧规则卡没有这个字段
+    # 时保持原样返回，行为与改动前一致。
+    artwork_orientation = _get_artwork_orientation(rule)
+    corrected = _apply_orientation(source_width, source_height, artwork_orientation)
+    source_width, source_height = corrected
+
     return {
         "success": True,
         "data": {
@@ -241,5 +294,6 @@ async def get_extractable_elements(rule_id: str):
             "total": len(elements),
             "source_width": source_width,
             "source_height": source_height,
+            "artwork_orientation": artwork_orientation or "",
         },
     }

@@ -36,7 +36,15 @@ export function getProductOptionsFromRuleCard(ruleCard: any): Array<{ label: str
   if (!adaptations || typeof adaptations !== 'object' || Object.keys(adaptations).length === 0) {
     return FALLBACK_OPTIONS;
   }
-  return Object.keys(adaptations).map((key) => ({ label: key, value: key }));
+  /* 2026-08-18：过滤掉 `Unknown 未识别`——那是 AI 确实判断不出载体时的兜底值
+   * （见后端 prompts/rule_extraction.py 第 4 层），拿它当目标产品会让生图提示词
+   * 首句变成 "Create a Unknown print-on-demand design."。此时回落到内置常见产品，
+   * 用户可自行选或用"✏️ 自定义"填。 */
+  const keys = Object.keys(adaptations).filter((k) => !/未识别|^Unknown\b/.test(k));
+  if (keys.length === 0) {
+    return FALLBACK_OPTIONS;
+  }
+  return keys.map((key) => ({ label: key, value: key }));
 }
 
 interface ProductSelectProps {

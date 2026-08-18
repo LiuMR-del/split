@@ -21,6 +21,9 @@ VOCAB_FILES = [
     "color_mood",
     "selling_point_type",
     "layout_type",
+    # 2026-08-18：产品类型词表（AI 品类识别的受控清单，见 prompts/rule_extraction.py）。
+    # 注入分析 prompt 前会转成 `English 中文` 格式，这里按词表原始格式（中文/English）返回
+    "product_type",
 ]
 
 

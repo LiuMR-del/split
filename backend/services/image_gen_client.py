@@ -42,6 +42,7 @@ class ImageGenClient:
         height: int = 1024,
         negative_prompt: str = "",
         reference_images: Optional[List[dict]] = None,
+        force_opaque: bool = False,
     ) -> dict:
         """
         提交生图任务。
@@ -57,6 +58,9 @@ class ImageGenClient:
                 当前不支持（REFERENCE_SUPPORT），传了也会被忽略，调用方
                 （routers/image_gen.py）应先查 REFERENCE_SUPPORT 再决定要不要
                 准备这些图，避免白做图片预处理的开销。
+            force_opaque: 要求上游返回**不透明整图**（`background="opaque"`），
+                由本地抠图。元素拆分（version='E'）专用，见下方 `_openai_generate`
+                里该参数的注释。仅 OpenAI 模式生效。
 
         返回:
             openai 模式:
@@ -65,7 +69,9 @@ class ImageGenClient:
                 {"out_task_id": str, "status": str, "task_id": str, "estimated_credits": float}
         """
         if self.config.api_type == "openai":
-            return await self._openai_generate(prompt, negative_prompt, width, height, reference_images)
+            return await self._openai_generate(
+                prompt, negative_prompt, width, height, reference_images, force_opaque
+            )
         else:
             return await self._aireiter_submit(prompt, negative_prompt, width, height)
 
@@ -108,12 +114,24 @@ class ImageGenClient:
         width: int,
         height: int,
         reference_images: Optional[List[dict]] = None,
+        force_opaque: bool = False,
     ) -> dict:
         """OpenAI 同步生图（gpt-image-2 等）。
 
         #7：有参考图时切 /v1/images/edits（multipart，真正带图生成，Spike 已验证）；
         无图走现状 /v1/images/generations（纯文本）。两分支共用 negative_prompt 合并、
         size 转换、响应解析逻辑。
+
+        ## force_opaque：为什么要主动要求"不透明"（2026-08-18）
+
+        元素拆分不传任何 background 参数时，上游会**自作主张返回 RGBA 抠好的图**，
+        但它抠得不好：实测 18 张里 `wildflower sprigs` 内部碎洞 4.68%、
+        `eucalyptus branches` 2.33%、`ivy vines` 2.48%，浅色主体边缘也有碎洞。
+        这些洞是上游抠的，本地拿到时**已经丢了信息**（洞里是纯透明，原色不可恢复）。
+
+        改为显式 `background="opaque"` 要整图，再由 `image_alpha_utils` 本地抠——
+        本地有连通性判据（从画布边缘漫进来的白才是背景）+ 环形中心面积例外，
+        实测同一批图本地抠图碎洞降到 1.07%/0.03%，且圆环中心仍正确透明。
         """
         out_task_id = f"split-{uuid.uuid4().hex[:12]}"
 
@@ -145,6 +163,9 @@ class ImageGenClient:
                     "n": "1",
                     "size": size,
                 }
+                if force_opaque:
+                    # multipart 的字段值必须是字符串
+                    data["background"] = "opaque"
                 try:
                     resp = await client.post(
                         url, files=files, data=data,
@@ -162,6 +183,8 @@ class ImageGenClient:
                     "n": 1,
                     "size": size,
                 }
+                if force_opaque:
+                    body["background"] = "opaque"
                 try:
                     resp = await client.post(url, json=body, headers=self._headers())
                 except httpx.ConnectError:

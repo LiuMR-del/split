@@ -313,6 +313,10 @@ async def submit_gen_task(request: ImageGenRequest):
                 height=request.height,
                 negative_prompt=request.prompt_negative,
                 reference_images=reference_images,
+                # 2026-08-18：元素拆分要上游返回**不透明整图**，由本地抠。
+                # 不传这个参数时上游会自己抠，但抠得有碎洞（实测最高 4.68%）且
+                # 信息已丢失无法本地补救，见 image_gen_client._openai_generate 注释。
+                force_opaque=(request.version == "E"),
             )
             is_sync_completed = result.get("status") == "completed" and result.get("image_urls")
 

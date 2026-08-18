@@ -214,13 +214,23 @@ def get_option_translation_prompt(terms_json: str) -> str:
 #    （用户实测反馈）。因为主体在画面里太显著，泛化的"其他元素"不足以让模型动它。
 #    改成从规则卡列出其余元素名逐个点名 + 明说"如果主体在清单里就必须擦掉"后解决。
 #    清单由 extract_element_list 在生成 extraction_prompt 时按"同卡其余元素"填充。
+# 6. **画布比例锚定"印刷图案区域"而不是"整张图"**（2026-08-18）：竞品图常是实物
+#    摆拍——RULE-0063 是 2000×2000 方形照片，拍的却是户外灯笼，真正的印刷图案是
+#    面板上约 1:2.2 的窄竖条，四周全是灯具外壳和草地虚化背景。旧措辞
+#    "same aspect ratio and framing as the provided image" 会让模型对齐**整张照片**，
+#    且与后端按 `artwork_orientation` 校正后的竖版画布请求**直接矛盾**（一句要方、
+#    一句要竖，模型只能二选一）。改为显式锚定 "the printed artwork area ... not the
+#    whole photograph"，与第 4 段的"忽略画框/实物语境"同向加强。
+#    两个模板都改，配套后端 routers/prompts.py 的 `_apply_orientation`。
 ELEMENT_EXTRACTION_PROMPT_TEMPLATE = (
     "From the provided image, keep ONLY {element} and delete everything else. "
     "This is an erase-everything-else task, NOT a re-draw task: "
     "{element} must stay at EXACTLY the same position, same size, same scale and same "
     "orientation as in the provided image — do not move it, do not resize it, "
     "do not re-center it, do not crop it. "
-    "Keep the output canvas the same aspect ratio and framing as the provided image. "
+    "Keep the output canvas the same aspect ratio and framing as the printed artwork area "
+    "of the provided image (if the image is a product photo, this is the artwork panel only, "
+    "not the whole photograph). "
     "You MUST erase these — {others} — plus all text, all lettering, all numbers and the "
     "original background. Erasing the main subject is REQUIRED if it is listed above: "
     "the output must contain {element} and nothing else. "
@@ -256,7 +266,9 @@ ELEMENT_VARIANT_PROMPT_TEMPLATE = (
     "The replacement must occupy EXACTLY the same position, same size, same scale and same "
     "framing as the original {element_role} in the provided image{pose_clause} — "
     "do not move it, do not resize it, do not re-center it. "
-    "Keep the output canvas the same aspect ratio and framing as the provided image. "
+    "Keep the output canvas the same aspect ratio and framing as the printed artwork area "
+    "of the provided image (if the image is a product photo, this is the artwork panel only, "
+    "not the whole photograph). "
     "You MUST erase these — {others} — plus all text, all lettering, all numbers and the "
     "original background. Erasing them is REQUIRED: "
     "the output must contain only {variant} and nothing else. "

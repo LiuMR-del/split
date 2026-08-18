@@ -39,6 +39,13 @@ class VisualStructureLayer(BaseModel):
     """第 2 层：视觉结构层"""
     layout_formula: str = Field(description="构图公式")
     layout_formula_en: Optional[str] = Field(default=None, description="构图公式英文版，用于英文生图提示词")
+    # 2026-08-18：**印刷图案本身**的朝向（portrait/landscape/square），不是上传文件的朝向。
+    # 竞品图常是实物摆拍（如方形照片里拍竖条形灯笼面板），文件比例 ≠ 图案比例，
+    # 元素拆分按文件比例请求画布会把图案挤扁、位置全错。Optional：旧规则卡没有此字段，
+    # 消费方（routers/prompts.py 元素端点）取不到时回落文件比例。
+    artwork_orientation: Optional[str] = Field(
+        default=None, description="印刷图案本身的朝向：portrait/landscape/square"
+    )
     must_have_elements: List[MustHaveElement] = Field(description="必备元素")
     style: str = Field(description="视觉风格")
     color_mood: str = Field(description="色彩情绪")

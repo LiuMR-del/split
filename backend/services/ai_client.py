@@ -26,6 +26,28 @@ _RETRY_BASE_DELAY = 1.0      # 首次重试等待 1 秒，第二次等待 2 秒
 logger = logging.getLogger(__name__)
 
 
+def _raise_with_body(resp) -> None:
+    """非 2xx 时抛 HTTPStatusError，但把**响应体**带进异常消息。
+
+    裸 `raise_for_status()` 的消息只有 "Server error '502 Bad Gateway' for url ..."，
+    上游代理返回的具体原因（模型过载/额度耗尽/参数不合法）全在响应体里，丢掉后
+    排查只能靠猜（2026-08-18 上游 502 故障时踩到：分析页只显示空壳卡，没有任何
+    可定位的原因）。异常类型保持 HTTPStatusError 不变，_request_with_retry 的
+    429/5xx 重试判断不受影响。
+    """
+    if resp.status_code < 400:
+        return
+    body = ""
+    try:
+        body = (resp.text or "")[:300].strip()
+    except Exception:
+        pass
+    detail = f"HTTP {resp.status_code} from {resp.request.url}"
+    if body:
+        detail += f"，上游响应体：{body}"
+    raise httpx.HTTPStatusError(detail, request=resp.request, response=resp)
+
+
 async def _request_with_retry(fn, *args, **kwargs):
     """带指数退避重试的请求包装器。
 
@@ -177,7 +199,7 @@ class AIClient:
         async def _do_request():
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
+                _raise_with_body(resp)
                 data = resp.json()
                 return data["choices"][0]["message"]["content"]
 
@@ -204,7 +226,7 @@ class AIClient:
         async def _do_request():
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
+                _raise_with_body(resp)
                 data = resp.json()
                 return data["choices"][0]["message"]["content"]
 
@@ -285,7 +307,7 @@ class AIClient:
         async def _do_request():
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
+                _raise_with_body(resp)
                 data = resp.json()
                 # Anthropic 响应格式：content 是数组，取第一个 text block
                 for block in data.get("content", []):
@@ -315,7 +337,7 @@ class AIClient:
         async def _do_request():
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
+                _raise_with_body(resp)
                 data = resp.json()
                 for block in data.get("content", []):
                     if block.get("type") == "text":

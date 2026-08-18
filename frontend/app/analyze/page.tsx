@@ -277,7 +277,12 @@ export default function AnalyzePage() {
       const data = unwrapData<any>(response);
       const card = data?.rule_card || data;
 
-      if (card && typeof card === 'object' && !card.parse_error) {
+      /* ⚠️ 后端的失败标记字段是 `_parse_error`（带下划线，image_analyzer.py 写入），
+       * 这里曾检查不带下划线的 `parse_error`——字段名不同步导致"AI 上游 502"这类
+       * 失败被当成成功、渲染成空壳卡且看不到任何原因（2026-08-18 用户实测踩中）。
+       * 两个名字都查，兼容万一的旧格式。 */
+      const parseErr = card?._parse_error || card?.parse_error;
+      if (card && typeof card === 'object' && !parseErr) {
         setRuleCard(card);
         /* 构建服务器端图片 URL */
         if (data?.uploaded_image) {
@@ -286,7 +291,9 @@ export default function AnalyzePage() {
         setStage('done');
         setPageState('done');
       } else {
-        throw new Error(response?.message || card?.parse_error || '分析失败');
+        throw new Error(
+          parseErr ? `AI 分析失败（可稍后重试）：${parseErr}` : response?.message || '分析失败'
+        );
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '分析失败，请重试';
@@ -336,8 +343,12 @@ export default function AnalyzePage() {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const data = unwrapData<any>(res);
           const card = data?.rule_card || data;
-          if (!card || typeof card !== 'object' || card.parse_error) {
-            throw new Error(card?.parse_error || res?.message || '分析失败');
+          /* 同单图路径：后端失败标记是 `_parse_error`（带下划线），两个名字都查 */
+          const batchParseErr = card?._parse_error || card?.parse_error;
+          if (!card || typeof card !== 'object' || batchParseErr) {
+            throw new Error(
+              batchParseErr ? `AI 分析失败（可稍后重试）：${batchParseErr}` : res?.message || '分析失败'
+            );
           }
 
           /* 决策点 4：分析成功自动保存进规则库（字段拼装与单图 handleSave 完全同款）。
