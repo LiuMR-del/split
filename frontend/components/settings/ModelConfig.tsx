@@ -200,13 +200,19 @@ export default function ModelConfig() {
       />
 
       {/* API URL */}
-      <Input
-        label="API URL"
-        type="text"
-        value={apiUrl}
-        onChange={(e) => setApiUrl(e.currentTarget.value)}
-        placeholder="输入 API 地址"
-      />
+      <div className="space-y-1.5">
+        <Input
+          label="API URL"
+          type="text"
+          value={apiUrl}
+          onChange={(e) => setApiUrl(e.currentTarget.value)}
+          placeholder="如 https://api.example.com/v1（需以 /v1 结尾）"
+        />
+        <p className="text-xs text-codex-text-secondary font-mono">
+          地址<span className="text-codex-warning">需以 /v1 结尾</span>
+          （系统只拼接最后一段路径；注意与「生图 API 配置」的地址格式不同）
+        </p>
+      </div>
 
       {/* API Key */}
       <Input

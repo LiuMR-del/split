@@ -157,13 +157,19 @@ export default function ImageGenConfig() {
       />
 
       {/* API URL */}
-      <Input
-        label="API URL"
-        type="text"
-        value={apiUrl}
-        onChange={(e) => setApiUrl(e.currentTarget.value)}
-        placeholder={apiType === 'openai' ? '输入 OpenAI 兼容 API 地址' : '输入 AIReiter API 地址'}
-      />
+      <div className="space-y-1.5">
+        <Input
+          label="API URL"
+          type="text"
+          value={apiUrl}
+          onChange={(e) => setApiUrl(e.currentTarget.value)}
+          placeholder={apiType === 'openai' ? '如 http://主机:端口（不要以 /v1 结尾）' : '输入 AIReiter API 地址'}
+        />
+        <p className="text-xs text-codex-text-secondary font-mono">
+          填服务器根地址，<span className="text-codex-warning">不要带 /v1 后缀</span>
+          （生图路径由系统自动拼接，与「AI 模型配置」的地址格式不同）
+        </p>
+      </div>
 
       {/* API Key */}
       <Input

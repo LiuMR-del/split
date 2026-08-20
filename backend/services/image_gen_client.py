@@ -23,7 +23,13 @@ class ImageGenClient:
 
     def __init__(self, config: ImageGenConfig):
         self.config = config
-        self.base_url = config.api_url.rstrip("/")
+        base = config.api_url.rstrip("/")
+        # 防呆归一化：生图的具体路径全部由本类按 api_type 拼接（/v1/images/... 或
+        # /api/openapi/...），api_url 只应填服务器根地址。末尾的 /v1 必然是照抄
+        # AI 分析配置（那边约定带 /v1）导致的填错，不剥掉会拼成 /v1/v1/... 全部 404。
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")].rstrip("/")
+        self.base_url = base
 
     def _headers(self, include_content_type: bool = True) -> dict:
         """构建请求头。multipart 请求（/v1/images/edits）不能手动设 Content-Type
