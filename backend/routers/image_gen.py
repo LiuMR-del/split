@@ -623,6 +623,32 @@ _MAX_ZIP_TASKS = 20
 class DownloadZipRequest(BaseModel):
     """批量打包下载请求（三期阶段四）"""
     task_ids: List[str] = Field(description="要打包的任务 ID 列表")
+    # 2026-08-20：zip 内文件名改用中文可读名（如 "背景月亮颜色_紫色满月.png"）。
+    # 名字只有前端知道（维度名 + 中文译名都在元素清单里，后端任务记录没有），
+    # 所以由前端按 task_id 传进来；缺失/非法时回落 task_id 前缀的旧命名。
+    filenames: Optional[dict] = Field(
+        default=None, description="task_id -> 期望的 zip 内文件名（不含扩展名）"
+    )
+
+
+# 文件名非法字符（Windows 解压会失败）+ 控制字符，一律替换成下划线
+_FILENAME_BAD_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t\x00-\x1f]')
+# 单个文件名最大长度（不含扩展名）。中文占 3 字节，60 字符足够表达且不触发路径长度限制
+_FILENAME_MAX_LEN = 60
+
+
+def _safe_zip_name(raw: str) -> str:
+    """把前端传来的中文文件名清洗成可安全放进 zip 的名字。
+
+    非法字符替换成 `_`、去掉首尾空白与点（`.` 开头在部分系统是隐藏文件，
+    末尾点在 Windows 会被吞）、超长截断。清洗后为空返回空串，调用方回落旧命名。
+    """
+    if not isinstance(raw, str):
+        return ""
+    name = _FILENAME_BAD_CHARS.sub("_", raw).strip().strip(".")
+    if len(name) > _FILENAME_MAX_LEN:
+        name = name[:_FILENAME_MAX_LEN]
+    return name.strip()
 
 
 @router.post("/download-zip")
@@ -669,10 +695,22 @@ async def download_gen_images_zip(request: DownloadZipRequest):
 
     # ZIP_STORED（不压缩）：图片本身已是压缩格式，再压几乎不减体积却明显更慢
     buf = io.BytesIO()
+    name_map = request.filenames if isinstance(request.filenames, dict) else {}
+    used_names = set()  # 已占用的 zip 内文件名，撞名时加 _2/_3 后缀
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         for tid, fp in collected:
-            # zip 内文件名带 task_id 前缀，防不同任务的同名文件互相覆盖
-            zf.write(str(fp), arcname=f"{tid}_{fp.name}")
+            # 2026-08-20：优先用前端传的中文可读名（"背景月亮颜色_紫色满月"）。
+            # 拿不到或清洗后为空时回落 task_id 前缀的旧命名（防不同任务同名覆盖）。
+            base = _safe_zip_name(name_map.get(tid, "")) or f"{tid}_{fp.stem}"
+            suffix = fp.suffix or ".png"
+            candidate = f"{base}{suffix}"
+            # 译名可能撞车（如两个变体都译成"红月"），加序号后缀避免 zip 内互相覆盖
+            seq = 2
+            while candidate in used_names:
+                candidate = f"{base}_{seq}{suffix}"
+                seq += 1
+            used_names.add(candidate)
+            zf.write(str(fp), arcname=candidate)
     buf.seek(0)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

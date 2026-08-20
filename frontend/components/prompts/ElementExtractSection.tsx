@@ -51,6 +51,33 @@ interface ElementFromApi {
   is_text_slot: boolean;
   extraction_prompt: string;
   variants: VariantFromApi[];
+  /* 自定义变体的提示词模板，把 CUSTOM_PLACEHOLDER 换成用户输入即可（2026-08-20） */
+  custom_prompt_template?: string;
+}
+
+/* 后端 _build_custom_variant_template 里的占位符，必须与
+ * services/prompt_generator.CUSTOM_VARIANT_PLACEHOLDER 保持一致 */
+const CUSTOM_PLACEHOLDER = '__CUSTOM_VARIANT__';
+
+/* 判断字符串是否含中文 */
+const hasCJK = (s: string) => /[\u4e00-\u9fff]/.test(s || '');
+
+/* 下载文件名用的"可读名"：优先中文译名 → 本身含中文 → 英文原值（特殊标识如
+ * 2016-2026 / Rock / NAME 翻译不了也不该翻，原样保留）。2026-08-20 用户需求。 */
+function displayName(job: JobItem): string {
+  if (job.labelTranslated && hasCJK(job.labelTranslated)) return job.labelTranslated;
+  if (hasCJK(job.labelCn)) return job.labelCn;
+  return job.labelCn;
+}
+
+/* 清洗成合法文件名：非法字符替换、去首尾空白与点、限长（与后端 _safe_zip_name 同规则） */
+function safeFileName(raw: string): string {
+  return (raw || '')
+    .replace(/[\\/:*?"<>|\r\n\t]/g, '_')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, 60)
+    .trim();
 }
 
 /* 组件内部维护的"一个待生成任务" = 某维度下的某个变体 */
@@ -65,6 +92,8 @@ interface JobItem {
   /** 英文候选名的中文附注（无则不显示） */
   labelTranslated?: string;
   isOriginal: boolean;
+  /** 用户自定义添加的变体（2026-08-20），界面加"自定义"徽标 */
+  isCustom?: boolean;
   prompt: string;
   /* 本地状态 */
   checked: boolean;
@@ -120,6 +149,9 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
   const [sourceSize, setSourceSize] = useState<{ w: number; h: number } | null>(null);
   /* 图案朝向（portrait/landscape/square），仅用于界面提示画布依据；空=旧规则卡未判断 */
   const [artworkOrientation, setArtworkOrientation] = useState('');
+  /* 自定义变体输入框的值与校验错误（key: element_key）。2026-08-20 用户需求 */
+  const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
+  const [customErrors, setCustomErrors] = useState<Record<string, string>>({});
 
   /* 权威队列在 ref 里——生成循环是跑几分钟的 async 函数，闭包读 state 是旧值
    * （同阶段二批量分析队列的做法，见 CLAUDE.md） */
@@ -234,6 +266,8 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
   };
 
   const checkedCount = jobs.filter((j) => j.checked && j.status !== 'done').length;
+  /* 失败项数量（"重试全部失败"按钮用） */
+  const failedCount = jobs.filter((j) => j.status === 'failed').length;
   const doneJobs = jobs.filter((j) => j.status === 'done' && j.imageUrl);
   const zipCount = doneJobs.filter((j) => j.downloadChecked && j.taskId).length;
 
@@ -306,6 +340,71 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
     void runQueue();
   };
 
+  /* 一键重试全部失败项（2026-08-20 用户需求）。生成循环的语义是"处理所有 queued 项"，
+   * 所以只要把失败项批量置回 queued 再启动同一个 runQueue 即可，不用另写重试逻辑。 */
+  const handleRetryAllFailed = () => {
+    if (runningRef.current) return;
+    const failed = jobsRef.current.filter((j) => j.status === 'failed');
+    if (failed.length === 0) return;
+    const failedKeys = new Set(failed.map((j) => j.key));
+    writeJobs(
+      jobsRef.current.map((j) =>
+        failedKeys.has(j.key) ? { ...j, status: 'queued' as const, error: undefined } : j
+      )
+    );
+    void runQueue();
+  };
+
+  /* 添加一个自定义变体（2026-08-20 用户需求）。
+   * 用后端给的 custom_prompt_template 替换占位符——与该维度其他变体共用同一套
+   * 位置/姿态/风格锁定指令，素材可直接叠换。中文原样使用（生图模型看得懂）。
+   * 不持久化（用户确认：可用范围小，刷新即弃）。 */
+  const handleAddCustom = (el: ElementFromApi) => {
+    const raw = (customInputs[el.element_key] || '').trim();
+    const setErr = (msg: string) =>
+      setCustomErrors((prev) => ({ ...prev, [el.element_key]: msg }));
+    if (!raw) {
+      setErr('请输入变体内容');
+      return;
+    }
+    if (raw.length > 100) {
+      setErr('太长了，请控制在 100 字以内');
+      return;
+    }
+    const tpl = el.custom_prompt_template;
+    if (!tpl || !tpl.includes(CUSTOM_PLACEHOLDER)) {
+      setErr('该维度暂不支持自定义（规则卡数据不完整），请重新分析竞品图');
+      return;
+    }
+    /* 与该维度已有候选查重（含已添加的自定义项），避免重复生成白烧钱 */
+    const exists = jobsRef.current.some(
+      (j) =>
+        j.elementKey === el.element_key &&
+        (j.labelCn.trim().toLowerCase() === raw.toLowerCase() ||
+          (j.labelTranslated || '').trim() === raw)
+    );
+    if (exists) {
+      setErr('这个候选已经在列表里了');
+      return;
+    }
+    const job: JobItem = {
+      key: `${el.element_key}::custom-${Date.now()}`,
+      elementKey: el.element_key,
+      elementName: el.name_cn,
+      labelCn: raw,
+      isOriginal: false,
+      isCustom: true,
+      prompt: tpl.replace(CUSTOM_PLACEHOLDER, raw),
+      /* 主动输入的就是想生成的，默认勾选 */
+      checked: true,
+      status: 'idle',
+      downloadChecked: true,
+    };
+    writeJobs([...jobsRef.current, job]);
+    setCustomInputs((prev) => ({ ...prev, [el.element_key]: '' }));
+    setCustomErrors((prev) => ({ ...prev, [el.element_key]: '' }));
+  };
+
   /* 单张下载：调现有 POST /api/gen/download/{task_id} 取本地可访问路径 */
   const handleDownloadOne = async (job: JobItem) => {
     if (!job.taskId) return;
@@ -319,7 +418,7 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
       if (!path) throw new Error('未返回可下载路径');
       const a = document.createElement('a');
       a.href = getImageUrl(path);
-      a.download = `${job.elementName}_${job.labelCn}.png`;
+      a.download = `${safeFileName(job.elementName)}_${safeFileName(displayName(job))}.png`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -333,8 +432,15 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
   /* 打包下载：POST /api/gen/download-zip 返回**裸 zip 二进制**，
    * 不能用 apiPost（它会 response.json() 直接崩），必须原生 fetch 取 blob */
   const handleDownloadZip = async () => {
-    const taskIds = doneJobs.filter((j) => j.downloadChecked && j.taskId).map((j) => j.taskId!);
+    const picked = doneJobs.filter((j) => j.downloadChecked && j.taskId);
+    const taskIds = picked.map((j) => j.taskId!);
     if (taskIds.length === 0) return;
+    /* 2026-08-20：zip 内文件名用中文可读名（"背景月亮颜色_紫色满月"）。
+     * 维度名与中文译名只有前端有，按 task_id 传给后端；后端会再清洗一遍并处理撞名。 */
+    const filenames: Record<string, string> = {};
+    for (const j of picked) {
+      filenames[j.taskId!] = `${safeFileName(j.elementName)}_${safeFileName(displayName(j))}`;
+    }
     setZipping(true);
     setZipError('');
     let objectUrl = '';
@@ -342,7 +448,7 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
       const res = await fetch(`${BASE_URL}/api/gen/download-zip`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_ids: taskIds }),
+        body: JSON.stringify({ task_ids: taskIds, filenames }),
       });
       if (!res.ok) {
         throw new Error((await res.text().catch(() => '')) || `HTTP ${res.status}`);
@@ -532,6 +638,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                                     原始
                                   </span>
                                 )}
+                                {job.isCustom && (
+                                  <span className="px-1 py-0.5 text-[10px] font-mono rounded bg-codex-accent/20 text-codex-accent">
+                                    自定义
+                                  </span>
+                                )}
                                 {job.status === 'generating' && (
                                   <span className="text-[10px] font-mono text-codex-warning">生成中…</span>
                                 )}
@@ -559,6 +670,43 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                             </div>
                           </label>
                         ))}
+
+                        {/* 自定义变体输入（2026-08-20 用户需求）：词表里没有的候选自己加。
+                            与该维度其他变体共用同一套位置/姿态/风格锁定指令（后端模板），
+                            所以出图可直接与其他素材叠换。不持久化，刷新即弃。 */}
+                        <div className="px-1.5 pt-1.5 border-t border-codex-border/60 space-y-1">
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={customInputs[el.element_key] || ''}
+                              onChange={(e) =>
+                                setCustomInputs((prev) => ({ ...prev, [el.element_key]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleAddCustom(el);
+                                }
+                              }}
+                              disabled={running}
+                              placeholder="自定义候选，如 pink moon / 粉色月亮"
+                              maxLength={100}
+                              className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-codex-bg border border-codex-border rounded text-codex-text placeholder:text-codex-text-secondary/60 focus:border-codex-accent outline-none disabled:opacity-50"
+                            />
+                            <button
+                              onClick={() => handleAddCustom(el)}
+                              disabled={running || !(customInputs[el.element_key] || '').trim()}
+                              className="px-2 py-1 text-[11px] font-mono rounded border border-codex-border text-codex-accent hover:border-codex-accent disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shrink-0"
+                            >
+                              ➕ 添加
+                            </button>
+                          </div>
+                          {customErrors[el.element_key] && (
+                            <p className="text-[10px] font-mono text-codex-danger">
+                              {customErrors[el.element_key]}
+                            </p>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -585,6 +733,13 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                   disabled={stopping}
                 >
                   {stopping ? '⏹ 停止中（当前张跑完）' : '⏹ 停止'}
+                </Button>
+              )}
+              {/* 一键重试全部失败（2026-08-20）：生成时上游偶发失败很常见，
+                  逐个点重试很烦。队列空闲且有失败项时才显示 */}
+              {!running && failedCount > 0 && (
+                <Button variant="secondary" size="sm" onClick={handleRetryAllFailed}>
+                  🔄 重试全部失败（{failedCount}）
                 </Button>
               )}
             </div>

@@ -2156,6 +2156,9 @@ def extract_element_list(rule_card: dict) -> List[dict]:
         # 所以每个元素带一份 variants 清单——第 0 项是原始值（走擦除指令，图里本来就有），
         # 其余是 alternatives（走替换指令，图里没有需要换出来）。
         i["variants"] = _build_element_variants(i, others_text)
+        # 2026-08-20：自定义变体模板——用户在界面上输入词表里没有的候选（如
+        # "pink moon"），前端把占位符替换成输入值即得一条与其他变体同规格的指令。
+        i["custom_prompt_template"] = _build_custom_variant_template(i, others_text)
 
     return deduped
 
@@ -2217,6 +2220,38 @@ def _build_element_variants(item: dict, others_text: str) -> List[dict]:
             ),
         })
     return variants
+
+
+# 自定义变体提示词模板里的占位符：前端把用户输入替换进这里。
+# 之所以在后端产模板而不是让前端拼提示词——`element_role`/`pose_clause`/擦除清单
+# 都是后端算出来的（还涉及 _shorten_label 等规则），前端拼会散落一份逻辑，
+# 且铁律模板 ELEMENT_VARIANT_PROMPT_TEMPLATE 必须保持单一事实来源。
+CUSTOM_VARIANT_PLACEHOLDER = "__CUSTOM_VARIANT__"
+
+
+def _build_custom_variant_template(item: dict, others_text: str) -> str:
+    """产出"自定义变体"的提示词模板（2026-08-20 用户需求）。
+
+    与 `_build_element_variants` 里的替换分支**用同一个模板、同一套参数**
+    （element_role / pose_clause / others），只把变体值留成
+    `CUSTOM_VARIANT_PLACEHOLDER` 占位符，由前端替换成用户输入的值。
+    这样自定义变体与该维度其他变体的位置/姿态/风格锁定完全一致，素材可直接叠换。
+    """
+    raw = item.get("_raw") or {}
+    target = item["value_for_prompt"]
+    element_role = _shorten_label(target, max_words=8)
+    desc_en = raw.get("description_en") or ""
+    pose_clause = ""
+    if isinstance(desc_en, str) and len(desc_en.split()) >= 4:
+        pose = _shorten_label(desc_en, max_words=14)
+        if pose and pose.lower() != element_role.lower():
+            pose_clause = f" (keep the same pose and composition: {pose})"
+    return ELEMENT_VARIANT_PROMPT_TEMPLATE.format(
+        element_role=element_role,
+        variant=CUSTOM_VARIANT_PLACEHOLDER,
+        pose_clause=pose_clause,
+        others=others_text,
+    )
 
 
 def _shorten_label(label: str, max_words: int = 8) -> str:
