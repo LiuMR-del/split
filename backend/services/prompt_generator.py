@@ -9,14 +9,18 @@
 
 import json
 import logging
+import re
 from typing import List, Optional
 
 from prompts.prompt_generation import (
     get_recommendation_prompt,
     get_customization_analysis_prompt,
     get_option_translation_prompt,
+    get_variant_en_translation_prompt,
     ELEMENT_EXTRACTION_PROMPT_TEMPLATE,
     ELEMENT_VARIANT_PROMPT_TEMPLATE,
+    ELEMENT_TEXT_EXTRACTION_PROMPT_TEMPLATE,
+    ELEMENT_TEXT_VARIANT_PROMPT_TEMPLATE,
 )
 from services.ai_response_utils import extract_json_from_ai_response
 from services.vocab_utils import extract_english_part
@@ -1551,16 +1555,10 @@ class PromptGenerator:
     def _contains_cjk(self, text: str) -> bool:
         """判断 text 是否含 CJK（中日韩）汉字字符。
 
-        只检测中文汉字区间，不波及拉丁扩展字符（如 café/José/Mötley 的重音字母
-        é/ñ/ü 仍是合法的非英文文案，应保留）。覆盖：CJK 统一汉字(4E00-9FFF)、
-        扩展A(3400-4DBF)、兼容(F900-FAFF)、扩展B(20000-2FA1F)。
+        委托给模块级 `_module_contains_cjk`（单一事实来源）——元素变体的文字类
+        候选语言判断在模块级函数里也要用同一套判据，两份实现会漂移。
         """
-        for c in text:
-            cp = ord(c)
-            if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
-                    or 0xF900 <= cp <= 0xFAFF or 0x20000 <= cp <= 0x2FA1F):
-                return True
-        return False
+        return _module_contains_cjk(text)
 
     def _extract_product_name_en(self, target_product: str) -> str:
         """#4：从 target_product 提取英文产品名，供英文提示词首句使用。
@@ -1750,6 +1748,24 @@ _PLAIN_BACKGROUND_VALUE_KEYWORDS = (
     "plain white", "solid color", "solid white", "blank", "clean background",
     "plain background", "white background",
 )
+
+
+def _module_contains_cjk(text: str) -> bool:
+    """判断 text 是否含 CJK（中日韩）汉字字符——模块级单一事实来源。
+
+    只检测中文汉字区间，不波及拉丁扩展字符（如 café/José/Mötley 的重音字母
+    é/ñ/ü 仍是合法的非英文文案，应保留）。覆盖：CJK 统一汉字(4E00-9FFF)、
+    扩展A(3400-4DBF)、兼容(F900-FAFF)、扩展B(20000-2FA1F)。
+
+    `PromptGenerator._contains_cjk` 委托到这里；元素变体的文字类候选语言判断
+    （`_apply_text_variant_language`）是模块级函数，用不了实例方法，故提取。
+    """
+    for c in text or "":
+        cp = ord(c)
+        if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                or 0xF900 <= cp <= 0xFAFF or 0x20000 <= cp <= 0x2FA1F):
+            return True
+    return False
 
 
 def _looks_like_text_slot(name: str, value: str, explicit) -> bool:
@@ -2011,19 +2027,163 @@ async def translate_element_labels(elements: List[dict], ai_client) -> None:
                 v["label_translated"] = cn
 
 
+async def translate_variant_prompts_to_en(elements: List[dict], ai_client) -> None:
+    """把**文字类**变体里只有中文可用的候选值现翻成英文，供抠图指令使用（2026-08-21）。
+
+    ⚠️ **与上面的 `translate_element_labels` 方向相反，两者不可混用**：
+    - `translate_element_labels`：英→中，写 `label_translated`，**只给前端小字显示**。
+    - 本函数：中→英，改写 `label_for_prompt` **并重建 prompt**，要发给生图模型。
+
+    为什么需要：文字类候选的值就是要印进图里的文案，中文进去就画出中文字，违反
+    "图无中文 R1"铁律。7 张 7 月初的旧卡（RULE-0001/0014/0015/0017/0018/0019/0020）
+    整卡没有 `alternatives_en`，取不到英文平行值——若直接丢弃这些候选，
+    RULE-0019「励志金句内容」等维度会整组不可用，所以翻译顶上。
+
+    只处理 `_build_element_variants` 标了 `needs_en_translation` 的项；
+    `blocked_reason` 项不翻（语义上就要求非拉丁文字，翻了也还是那个意思）。
+    **不改 `label_cn`** —— 页面照旧显示中文供用户对照。结果不落盘（每次加载现翻，
+    同版本C 选项翻译的既有行为）。
+
+    容错：无 AI / 调用失败 / 数量不符 → 静默跳过，`label_for_prompt` 保持中文原值，
+    靠文字模板里的 "English only" 正向引导兜底。**绝不让元素清单接口因此不可用**。
+    """
+    if not ai_client or not elements:
+        return
+
+    # 收集待翻译项（去重，同一个中文值只翻一次）
+    pending = []   # [(variant, term)]
+    terms = []
+    seen = set()
+
+    def _want(term: str) -> None:
+        """把一个中文词条纳入本次批量翻译（去重）"""
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+
+    # role_pending: [(element, role_cn)] —— element_role 是"这个文字位叫什么"，
+    # 模板里出现 3 次且不是候选值，必须单独收集。**不能只靠 variants[0] 的翻译结果**：
+    # 漂移卡（original 纯英文、original_en 反而含中文，同 RULE-0070 那类）会让
+    # role_cn 含中文而 variants[0].label_cn 是英文、进不了 mapping，role 就永远翻不掉。
+    role_pending = []
+    for el in elements:
+        if not el.get("is_text_slot"):
+            continue
+        for v in el.get("variants", []):
+            if not v.get("needs_en_translation") or v.get("blocked_reason"):
+                continue
+            term = (v.get("label_cn") or "").strip()
+            if not term:
+                continue
+            pending.append((v, term))
+            _want(term)
+        role_cn = _shorten_label(el.get("value_for_prompt") or "", max_words=8)
+        if role_cn and _module_contains_cjk(role_cn):
+            role_pending.append((el, role_cn))
+            _want(role_cn)
+    if not terms:
+        return
+
+    system_prompt = get_variant_en_translation_prompt(json.dumps(terms, ensure_ascii=False))
+    try:
+        resp = await ai_client.text_request(
+            system_prompt, "请严格按 JSON 格式输出翻译结果。", temperature=0
+        )
+        result = extract_json_from_ai_response(resp)
+    except Exception:
+        logging.warning(
+            "文字类变体候选中→英翻译失败，回落中文值（靠模板 English only 引导）",
+            exc_info=True,
+        )
+        return
+    translations = (result or {}).get("translations") or []
+    if len(translations) != len(terms):
+        logging.warning(
+            "文字类变体候选翻译数量不符（请求 %d 返回 %d），跳过", len(terms), len(translations)
+        )
+        return
+
+    mapping = {}
+    for term, en in zip(terms, translations):
+        # 翻译结果自身含 CJK 说明模型没照要求做，这条不用（回落原值比塞中文进图安全）
+        if isinstance(en, str) and en.strip() and not _module_contains_cjk(en):
+            mapping[term] = en.strip()
+    if not mapping:
+        logging.warning("文字类变体候选翻译结果均不可用（含中文或为空），全部回落中文值")
+        return
+
+    for v, term in pending:
+        en = mapping.get(term)
+        if not en:
+            continue
+        old = v.get("label_for_prompt") or ""
+        v["label_for_prompt"] = en
+        # prompt 里嵌的是旧值，必须同步替换，否则翻译白做
+        if old and v.get("prompt"):
+            v["prompt"] = v["prompt"].replace(old, en)
+        v.pop("needs_en_translation", None)
+
+    # 文字类的 element_role（= 这个文字位叫什么，模板里出现 3 次）同样会被模型当作
+    # "要写什么字"的依据，含中文就会画出中文字。它不是候选值，所以上面单独收集了
+    # role_pending；这里把该维度**所有** prompt 里的中文 role 一并换掉。
+    #
+    # ⚠️ `custom_prompt_template` 必须一起换：它嵌的是同一个 element_role，
+    # 而前端 handleAddCustom 只校验**用户输入**不含中文，管不了模板自带的中文。
+    # 漏掉它 = 用户输入合法英文、发出去的指令里仍有两处中文（实测 RULE-0015 /
+    # 0019 / 0020 三个维度复现）。
+    for el, role_cn in role_pending:
+        role_en = mapping.get(role_cn)
+        if not role_en:
+            continue
+        role_en = _shorten_label(role_en, max_words=8)
+        for v in el.get("variants") or []:
+            if v.get("prompt"):
+                v["prompt"] = v["prompt"].replace(role_cn, role_en)
+        if el.get("custom_prompt_template"):
+            el["custom_prompt_template"] = el["custom_prompt_template"].replace(
+                role_cn, role_en
+            )
+
+
+def strip_blocked_variant_prompts(elements: List[dict]) -> None:
+    """把 blocked 变体的 prompt 清空（2026-08-21）。
+
+    blocked 变体的候选值语义上要求画非拉丁文字，不参与翻译，所以它的 prompt 里
+    可能仍留着中文值。前端有三重守卫（checkbox disabled / toggleChecked 拦截 /
+    handleGenerate 过滤）不会真的提交它，但**把含中文的指令留在 API 响应里是脏数据**：
+    将来若有人复制 prompt 手工调用、或加个"查看指令"入口，就会踩到铁律。
+    这里直接清空，`blocked_reason` 已经说明了原因，前端不显示 prompt。
+    """
+    for el in elements:
+        for v in el.get("variants", []):
+            if v.get("blocked_reason"):
+                v["prompt"] = ""
+
+
 def extract_element_list(rule_card: dict) -> List[dict]:
     """从规则卡提取"可拆分元素"清单（三期阶段四）。
 
-    数据来自两层，且这两层**经常记录同一个元素**（第3层记 `犬种名称='Dachshund'`、
-    第2层记 `主题文字区='大号手写体主题文字，当前为"Dachshund"'`），所以沿用
-    `_get_pod_hints` 已验证过的两道去重防线，否则同一元素会被抠两次、白烧两次钱。
+    **口径（2026-08-21 用户要求，推翻 2026-08-17 旧口径）**：本清单与界面上
+    「🔧 可变维度（选择变体）」下拉框**严格一对一**——同一批维度、同样的顺序、
+    一个不多一个不少。所以数据源只有第 3 层 `replaceable_elements`，与
+    `generate_version_c_template` 完全同源（它也是这个 dict 原样一对一映射）。
+
+    改动前这里额外从第 2 层 `must_have_elements` 补元素，并剔掉文字位/抽象维度、
+    跑四道去重防线，结果两个清单**必然对不上**：实测全库 57 张卡里 56 张不一致
+    （第 3 层 310 个维度只出 168 个，反而多出 48 个下拉框里根本没有的第 2 层项）。
+    用户反馈"元素变体素材要严格按照可变维度的变体列表，包括文案那些"。
+
+    因此判断从"剔除"改为"**打标**"，决定权交给用户（前端默认全不勾）：
+      - `is_text_slot`：文案类维度（抠字易糊，但用户要求可出）→ 走文字类专用模板
+      - `is_abstract`：抽象属性（配色/风格，抠不出实体）→ 前端标注警示
 
     参数:
         rule_card: 规则卡字典
 
     返回:
         List[dict]，每项含 element_key / name_cn / value_cn / value_for_prompt /
-        position / is_text_slot / extraction_prompt。非文字位在前，文字位排最后。
+        position / is_text_slot / is_abstract / extraction_prompt / variants /
+        custom_prompt_template。顺序与 `replaceable_elements` 的 key 序一致。
     """
     layer_2 = rule_card.get("layer_2_visual", {}) or {}
     layer_3 = rule_card.get("layer_3_variable", {}) or {}
@@ -2032,16 +2192,18 @@ def extract_element_list(rule_card: dict) -> List[dict]:
 
     items = []  # type: List[dict]
 
-    # ── 1. 第3层可替换元素 ──
+    # ── 1. 第3层可替换元素（唯一数据源，与可变维度下拉框同源）──
+    # 不做任何剔除：维度集合必须与 replaceable_elements 的 key 集合完全相等。
+    # 抽象属性（风格/配色）改为打标 is_abstract 交前端警示 + 默认不勾，
+    # 而不是像改动前那样直接 continue 丢掉（那会破坏一对一）。
     for dim, item in replaceable.items():
         if not isinstance(item, dict):
             continue
         value_cn = (item.get("original") or "").strip()
         value_for_prompt = _element_value_for_prompt(value_cn, item.get("original_en"))
         if not value_for_prompt:
-            continue
-        # 抽象属性（风格/配色/氛围）抠不出实体，直接排除，别浪费调用
-        if _is_abstract_dimension(dim, value_cn):
+            # original 与 original_en 双空——抠取指令没有目标可填，只能跳过。
+            # 实测全库 0 命中，纯防御（真出现时宁可少一项也不能发空指令）。
             continue
         items.append({
             "element_key": f"L3::{dim}",
@@ -2050,74 +2212,32 @@ def extract_element_list(rule_card: dict) -> List[dict]:
             "value_for_prompt": value_for_prompt,
             "position": "",
             "is_text_slot": _looks_like_text_slot(dim, value_cn, item.get("is_text_slot")),
+            "is_abstract": _is_abstract_dimension(dim, value_cn),
             "_raw": item,   # 原始层数据，_build_element_variants 要读 alternatives
         })
 
-    # ── 2. 第2层必备元素（去重防线①：语义去重）──
-    collected_names = {i["name_cn"] for i in items}
-    collected_values = {i["value_cn"] for i in items if i["value_cn"]} | \
-                       {i["value_for_prompt"] for i in items if i["value_for_prompt"]}
-    for el in must_have:
-        if not isinstance(el, dict):
-            continue
-        slot = (el.get("slot") or "").strip()
-        desc = (el.get("description") or "").strip()
-        # 防线①-a：槽位名与第3层维度同名 → 同一元素
-        if slot and slot in collected_names:
-            continue
-        # 防线①-b：描述里包含任一已收集的元素值 → 同一元素的两次记录
-        #（第2层描述常写成"…，当前为'xxx'"，xxx 正是第3层的 original）
-        if desc and any(v and v in desc for v in collected_values):
-            continue
-        value_for_prompt = _element_value_for_prompt(desc, el.get("description_en"))
-        if not value_for_prompt:
-            continue
-        if _is_abstract_dimension(slot, desc):
-            continue
-        # 防线①-c：词级重叠判重——措辞不同但说的是同一元素（如"尾巴造型"vs"人鱼尾巴"），
-        # 子串匹配挡不住，必须比实词重叠率
-        if _is_semantic_duplicate(value_for_prompt, [i["value_for_prompt"] for i in items]):
-            continue
-        # 防线①-d：中文维度名判重——第2层的"主体宠物肖像区"与第3层的"宠物类型"
-        # 是同一个位置，但英文措辞（构图描述 vs 品种名）实词交集为空，①-c 挡不住。
-        # 这类漏判的后果比多抠一张更严重：第2层项没有 alternatives，会在界面上
-        # 多出一个"只有 1 个候选"的重复维度，干扰用户勾选。
-        if _cn_name_overlaps(slot, [i["name_cn"] for i in items]):
-            continue
-        items.append({
-            "element_key": f"L2::{slot or value_for_prompt[:20]}",
-            "name_cn": slot or desc[:20],
-            "value_cn": desc,
-            "value_for_prompt": value_for_prompt,
-            "position": (el.get("position") or "").strip(),
-            "is_text_slot": _looks_like_text_slot(slot, desc, el.get("is_text_slot")),
-            "_raw": el,     # 第2层元素没有 alternatives，variants 只会有原始项
-        })
-
-    # ── 3. 去重防线②：全列表按 value_for_prompt 保序去重 ──
-    seen = set()
-    deduped = []  # type: List[dict]
-    for i in items:
-        key = i["value_for_prompt"]
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(i)
-
-    # ── 4. 只保留图形元素，剔除全部文字类（2026-08-17 用户确认的口径）──
-    # 用户要的是"图中的构建元素"——猫/花卉/彩虹/云朵/边框/图标这些看得见的图形。
-    # 文字类（名字 Luna、年份 2011-2026、纪念文案，以及"名字文字区"这类描述位）
-    # 抠出来只是一段字，没有素材价值，且抠字极易糊，所以直接不进清单。
-    # 仍然保留 is_text_slot 字段的解析（上面 _looks_like_text_slot），因为它就是这里
-    # 的过滤依据——旧规则卡没有该字段，全靠关键词兜底才能认出文字位。
-    deduped = [i for i in deduped if not i["is_text_slot"]]
+    # ⚠️ 这里**故意没有**按 value_for_prompt 的去重：两个不同维度的 original 若恰好
+    # 同值（如"背景色调"与"底纹配色"都填"米白"），去重会吃掉一个，直接破坏一对一。
+    # 第 3 层的 key 天然唯一，无需去重。
+    #
+    # ⚠️ 也**故意没有**第 2 层收集与四道去重防线（①-a 槽位名同名 / ①-b 描述含已收集值 /
+    # ①-c 词级重叠 _is_semantic_duplicate / ①-d 中文维度名 _cn_name_overlaps）——
+    # 那四道防线存在的唯一目的是"第 2 层与第 3 层去重"，第 2 层不再进清单后一并废弃。
+    # 相关函数（_cn_name_overlaps / _shared_role_words / _shared_entity_nouns /
+    # _ENTITY_SYNONYM_GROUPS / _ROLE_WORDS）保留定义未删：它们是 19 组用例调优出来的
+    # 资产，且 _ENTITY_NOUNS 仍被 _is_abstract_dimension 使用。
+    # _is_semantic_duplicate 也仍在用——见下面 others 清单的自相矛盾防护。
+    #
+    # ⚠️ 同样**故意没有**文字位过滤（改动前是 `[i for i in ... if not i["is_text_slot"]]`）：
+    # 文案类维度现在要进清单（走文字类专用模板），is_text_slot 的解析仍然必需——
+    # 它是"选哪套模板"和"候选值要不要转英文"的依据。
 
     # ── 5. 生成抠取指令 ──
     # 模板需要两个填充：目标元素 + **要擦掉的其余元素点名清单**。
     # 为什么要点名：只写 "Erase every other element" 时模型不敢删主体——实测抠
     # "彩虹拱门"时花卉/文字/云朵都擦干净了、猫却完整留着（用户实测反馈）。
-    # 排除清单要用**全部**元素（含被上面过滤掉的文字位），因为文字也得擦；
-    # 所以这里从 all_names 里排掉当前目标，而不是从 deduped 里排。
+    # 排除清单要用**两层的全部**元素（含文字位、含第 2 层描述）——第 2 层虽然不再
+    # 作为可抠元素进清单，但它记录的元素确实在画面上，抠图时同样得擦掉。
     all_labels = []
     for dim, item in replaceable.items():
         if isinstance(item, dict):
@@ -2132,26 +2252,36 @@ def extract_element_list(rule_card: dict) -> List[dict]:
             if label:
                 all_labels.append(label)
 
-    for i in deduped:
+    for i in items:
         # 目标元素也用短标签：完整长句会在模板里重复三次（keep ONLY / must stay /
         # must contain），冗长反而稀释指令强度
         target = _shorten_label(i["value_for_prompt"], max_words=10)
         # 排掉目标自己，以及与目标高度重叠的表述（同一元素的另一种措辞——
         # 复用词级重叠判重，否则会出现"擦掉 X"与"保留 X"自相矛盾的指令）
+        #
+        # ⚠️ 词级判重对**纯数字/超短标签失效**：`_semantic_words` 只取长度>2 的
+        # 英文单词，`2012-2026` / `1758-1848` 提取出空集，`_is_semantic_duplicate`
+        # 直接 return False。文字位进清单后这类目标（日期/年份）变得常见——实测
+        # RULE-0015「日期」、RULE-0017「年份」的指令同时要求"保留 2012-2026"和
+        # "擦掉…如'2012-2026'"，自相矛盾。所以补一层**字面子串**判断兜底。
         others = []
         seen_o = set()
         for label in all_labels:
             if label == target or label in seen_o:
                 continue
+            if target and target in label:
+                continue    # 该条描述里包含目标本身（如"生卒年份，如'2012-2026'"）
             if _is_semantic_duplicate(label, [target]):
                 continue
             seen_o.add(label)
             others.append(_shorten_label(label))
         # 兜底：万一算不出其余元素（单元素规则卡），退回泛化表述
         others_text = "; ".join(others) if others else "every other object and decoration"
-        i["extraction_prompt"] = ELEMENT_EXTRACTION_PROMPT_TEMPLATE.format(
-            element=target, others=others_text
-        )
+        # 文字类走专用模板：图形版写死了 "plus all text, all lettering, all numbers"，
+        # 抠文字本身时那句会把目标文字自己擦掉（见模板注释）
+        extraction_tpl = (ELEMENT_TEXT_EXTRACTION_PROMPT_TEMPLATE if i["is_text_slot"]
+                          else ELEMENT_EXTRACTION_PROMPT_TEMPLATE)
+        i["extraction_prompt"] = extraction_tpl.format(element=target, others=others_text)
         # 2026-08-17 用户澄清：真正要的是"这个维度下拉框里的**每个候选变体**都出一张"，
         # 所以每个元素带一份 variants 清单——第 0 项是原始值（走擦除指令，图里本来就有），
         # 其余是 alternatives（走替换指令，图里没有需要换出来）。
@@ -2159,8 +2289,12 @@ def extract_element_list(rule_card: dict) -> List[dict]:
         # 2026-08-20：自定义变体模板——用户在界面上输入词表里没有的候选（如
         # "pink moon"），前端把占位符替换成输入值即得一条与其他变体同规格的指令。
         i["custom_prompt_template"] = _build_custom_variant_template(i, others_text)
+        # `_raw` 是规则卡原始层数据，只给上面两个 _build_* 读 alternatives 用。
+        # 用完就剔掉：它会随 API 响应发给前端（前端并不消费），而本次清单从 168 项
+        # 扩到 310 项后这块冗余载荷接近翻倍。
+        i.pop("_raw", None)
 
-    return deduped
+    return items
 
 
 def _build_element_variants(item: dict, others_text: str) -> List[dict]:
@@ -2171,22 +2305,42 @@ def _build_element_variants(item: dict, others_text: str) -> List[dict]:
         others_text: 该元素对应的"要擦掉的其余元素"点名清单（与擦除指令共用）
 
     返回:
-        List[dict]，每项 {variant_key, label_cn, label_for_prompt, is_original, prompt}
-        —— 原始项 is_original=True 用擦除指令，其余用替换指令。
+        List[dict]，每项 {variant_key, label_cn, label_for_prompt, is_original,
+        prompt, blocked_reason?} —— 原始项 is_original=True 用擦除指令，其余用替换指令。
+
+    **文字类元素（is_text_slot=True）的取值语言更严**（2026-08-21）：
+    图形类候选的中文值只是给模型定位"图里哪个东西"（`REPLACE it with 小兔子`，
+    既有正常路径，7 张旧卡实测正常），但文字类候选的值**就是要印进图里的文案**，
+    中文进去就画出中文字，直接违反"图无中文 R1"铁律。所以：
+      - 优先 alternatives_en；
+      - 值含 CJK → 标 `needs_en_translation`，交 `translate_variant_prompts_to_en`
+        在路由层批量现翻（本函数是同步的，翻译是 async，只能分两步）；
+      - 值**语义上就要求非拉丁文字**（`Chinese memorial short quote`——值本身是纯
+        英文、过得了 CJK 检测，但意思就是"写中文"）→ 标 `blocked_reason`，前端置灰。
+    `label_cn` 一律保持原值不动——页面要显示中文供用户对照翻译。
     """
     raw = item.get("_raw") or {}
     target = item["value_for_prompt"]
+    is_text = bool(item.get("is_text_slot"))
     # element_role：告诉模型"要换的是画面里的哪个角色位"，用元素的短标签
     element_role = _shorten_label(target, max_words=8)
     # pose_clause：姿态/构图约束。只有当规则卡对该元素有**成句的形态描述**时才加——
     # 第3层的 value_cn 常常就是个短标签（"金毛犬"），拿它当姿态说明毫无信息量，
     # 反而占位、还可能把中文标签重复一遍。所以要求：有英文描述、且明显长于标签。
+    #
+    # ⚠️ 2026-08-21 实测：这段是**死代码**。description_en 只有第 2 层元素才有，
+    # 而第 2 层已不再进清单（第 3 层 310 个维度全都没有该字段），全库 939 张变体的
+    # prompt 零命中 "keep the same pose and composition"。保留是因为将来若让 VLM
+    # 给第 3 层补形态描述，这里能直接生效；改动它之前先确认字段是否真的有值。
     desc_en = raw.get("description_en") or ""
     pose_clause = ""
     if isinstance(desc_en, str) and len(desc_en.split()) >= 4:
         pose = _shorten_label(desc_en, max_words=14)
         if pose and pose.lower() != element_role.lower():
             pose_clause = f" (keep the same pose and composition: {pose})"
+
+    variant_tpl = (ELEMENT_TEXT_VARIANT_PROMPT_TEMPLATE if is_text
+                   else ELEMENT_VARIANT_PROMPT_TEMPLATE)
 
     variants = [{
         "variant_key": f"{item['element_key']}::original",
@@ -2195,6 +2349,9 @@ def _build_element_variants(item: dict, others_text: str) -> List[dict]:
         "is_original": True,
         "prompt": item["extraction_prompt"],
     }]
+    # 原始项也要过语言检查：文字类的 original 同样会被画进图里
+    if is_text:
+        _apply_text_variant_language(variants[0], item.get("value_cn") or "", target)
 
     alts = raw.get("alternatives") or []
     alts_en = raw.get("alternatives_en") or []
@@ -2207,19 +2364,95 @@ def _build_element_variants(item: dict, others_text: str) -> List[dict]:
         if idx < len(alts_en) and isinstance(alts_en[idx], str):
             alt_en = alts_en[idx].strip()
         label_for_prompt = alt_en or alt_cn
-        variants.append({
+        v = {
             "variant_key": f"{item['element_key']}::alt{idx}",
             "label_cn": alt_cn,
             "label_for_prompt": label_for_prompt,
             "is_original": False,
-            "prompt": ELEMENT_VARIANT_PROMPT_TEMPLATE.format(
-                element_role=element_role,
-                variant=label_for_prompt,
-                pose_clause=pose_clause,
-                others=others_text,
-            ),
-        })
+        }
+        if is_text:
+            _apply_text_variant_language(v, alt_cn, alt_en)
+        v["prompt"] = variant_tpl.format(
+            element_role=element_role,
+            variant=v["label_for_prompt"],
+            pose_clause=pose_clause,
+            others=others_text,
+        )
+        variants.append(v)
     return variants
+
+
+# 语义上要求"画出非拉丁文字"的候选特征词。这类候选即使值本身是纯英文
+# （`Chinese memorial short quote`）也必须挡掉——它的意思就是让模型写中文，
+# 与"图无中文 R1"铁律直接冲突，翻译也救不了（翻完还是这个意思）。
+# 实测全库仅 RULE-0071「纪念文案内容」命中 1 个候选（`中文纪念短句`）。
+#
+# ⚠️ **英文词用正则词边界匹配，不能用裸子串**：`arabic` 会命中 **Arabic**a（咖啡）、
+# `thai` 会命中 **Thai**land（泰国），这两个都是 POD 印花高频题材、与文字系统无关。
+# blocked 是唯一没有 override 的状态（候选永久不可勾），误封的代价比漏封大。
+# 同理**不收 japanese-style / korean-style 这类风格修饰**——"日式极简文案"要的是
+# 版式风格不是日文字，拦它属于误伤（`japanese` 仍在表内，但下面对
+# `-style`/`风` 修饰做了豁免）。
+_NON_LATIN_TEXT_KEYWORDS_EN = (
+    "chinese", "mandarin", "hanzi", "cjk", "japanese", "kanji", "kana",
+    "korean", "hangul", "arabic", "cyrillic", "hebrew", "thai",
+)
+_NON_LATIN_TEXT_KEYWORDS_CN = ("中文", "汉字", "日文", "韩文", "日语", "韩语")
+# 命中语言词但其实说的是"风格"而非"文字系统"，豁免（不 block）
+_LANG_STYLE_EXEMPT = ("-style", " style", "风格", "风", "式")
+_NON_LATIN_EN_RE = re.compile(
+    r"\b(" + "|".join(_NON_LATIN_TEXT_KEYWORDS_EN) + r")\b", re.IGNORECASE
+)
+
+
+def _requires_non_latin_text(label_cn: str, label_en: str) -> bool:
+    """判断候选是否"语义上就要求图中出现非拉丁文字"。
+
+    中文关键词用子串匹配（中文没有词边界概念，且"中文/汉字"这类词不会成为
+    其他常用词的子串）；英文关键词用**正则词边界**，避免 Arabica/Thailand 误伤。
+    命中语言词但同时带风格修饰（`Japanese-style`、`日式`）时豁免——那说的是版式
+    风格不是文字系统。
+    """
+    if any(k in (label_cn or "") for k in _NON_LATIN_TEXT_KEYWORDS_CN):
+        return True
+    blob = f"{label_cn} {label_en}"
+    if not _NON_LATIN_EN_RE.search(blob):
+        return False
+    low = blob.lower()
+    if any(x in low for x in _LANG_STYLE_EXEMPT):
+        return False
+    return True
+
+
+def _apply_text_variant_language(variant: dict, label_cn: str, label_en: str) -> None:
+    """给**文字类**变体决定 prompt 用的值，并在必要时打 blocked / 待翻译标记。
+
+    就地修改 variant，只动 `label_for_prompt` 与两个标记字段，
+    **绝不动 `label_cn`**——页面显示的中文必须原样保留供用户对照。
+
+    分支顺序不能调：blocked 必须最前。它是"语义上就要求写非拉丁文字"，
+    翻译救不了（翻完还是那个意思），后面任一分支先命中都会让它变成"可生成"。
+
+    参数:
+        variant: 待处理的变体字典
+        label_cn: 该候选的中文原值（用于语义关键词检测）
+        label_en: 该候选的英文平行值（可能为空）
+    """
+    if _requires_non_latin_text(label_cn, label_en):
+        variant["blocked_reason"] = "该候选要求图中出现非英文文字，与「图无中文」约束冲突"
+        return
+    # 英文平行值可用（无 CJK）→ 直接用，无需翻译
+    if label_en and not _module_contains_cjk(label_en):
+        variant["label_for_prompt"] = label_en
+        return
+    # 值本身就是英文/数字（无 CJK）→ 可用
+    if label_cn and not _module_contains_cjk(label_cn):
+        variant["label_for_prompt"] = label_cn
+        return
+    # 只剩中文可用 → 标记待翻译，由 translate_variant_prompts_to_en 在路由层批量现翻
+    if label_cn:
+        variant["needs_en_translation"] = True
+
 
 
 # 自定义变体提示词模板里的占位符：前端把用户输入替换进这里。
@@ -2246,7 +2479,12 @@ def _build_custom_variant_template(item: dict, others_text: str) -> str:
         pose = _shorten_label(desc_en, max_words=14)
         if pose and pose.lower() != element_role.lower():
             pose_clause = f" (keep the same pose and composition: {pose})"
-    return ELEMENT_VARIANT_PROMPT_TEMPLATE.format(
+    # 文字类走文字版替换模板（同 _build_element_variants 的分支）：图形版写死了
+    # "plus all text..." 会把目标文字自己擦掉。用户在前端输入的自定义文案若含中文，
+    # 模板里的 "English only" 会引导模型出英文（自定义值无法预先翻译，只能靠引导）。
+    tpl = (ELEMENT_TEXT_VARIANT_PROMPT_TEMPLATE if item.get("is_text_slot")
+           else ELEMENT_VARIANT_PROMPT_TEMPLATE)
+    return tpl.format(
         element_role=element_role,
         variant=CUSTOM_VARIANT_PLACEHOLDER,
         pose_clause=pose_clause,

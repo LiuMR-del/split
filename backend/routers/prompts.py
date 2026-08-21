@@ -14,7 +14,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from services.rule_store import get_rule
-from services.prompt_generator import PromptGenerator, extract_element_list, translate_element_labels
+from services.prompt_generator import (
+    PromptGenerator,
+    extract_element_list,
+    translate_element_labels,
+    translate_variant_prompts_to_en,
+    strip_blocked_variant_prompts,
+)
 from services.ai_client import load_ai_client_from_config
 from services.image_library_store import get_image
 
@@ -264,7 +270,19 @@ async def get_extractable_elements(rule_id: str):
     # （中英字段全英文，如 RULE-0070）才会发起**一次** AI 批量翻译调用。
     # 本端点原"纯同步不调 AI"的契约由此放宽为"必要时一次翻译调用"，
     # 无 AI 配置/翻译失败静默跳过，接口本身永不因翻译不可用。
-    await translate_element_labels(elements, load_ai_client_from_config())
+    #
+    # 2026-08-21：新增第二个方向的翻译。两者**方向相反、用途不同，必须都调**：
+    #   - translate_element_labels：英→中，写 label_translated，**只给页面显示**
+    #     （用户要"前端有中文好对照翻译"）
+    #   - translate_variant_prompts_to_en：中→英，改写 label_for_prompt + prompt，
+    #     **给生图模型**（守"图无中文 R1"铁律，文字类候选的值会被真的画进图里）
+    # 各自只在有对应待翻译项时才真的发请求；串行调用（两次都很轻，且失败互不影响）。
+    ai_client = load_ai_client_from_config()
+    await translate_element_labels(elements, ai_client)
+    await translate_variant_prompts_to_en(elements, ai_client)
+    # blocked 变体的 prompt 里可能留着中文（它不参与翻译）。前端有三重守卫不会提交它，
+    # 但含中文的指令留在响应里是脏数据，**无条件清空**（不依赖 AI 是否配置）。
+    strip_blocked_variant_prompts(elements)
 
     # 2026-08-17：连带返回竞品原图的实际宽高，供前端提交生图时按**原图比例**请求画布。
     # 抠取要求"保持原图位置与比例"，如果还按固定 1024×1024 方图请求，竖版竞品图会被

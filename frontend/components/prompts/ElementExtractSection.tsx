@@ -39,6 +39,9 @@ interface VariantFromApi {
   label_for_prompt: string;
   is_original: boolean;
   prompt: string;
+  /* 该候选不可生成的原因（2026-08-21）：候选语义上要求图中出现非英文文字，
+   * 与「图无中文」铁律冲突。有值时前端置灰不可勾选，但 label_cn 照常显示。 */
+  blocked_reason?: string;
 }
 
 /* 后端 GET /api/prompts/elements/{rule_id} 返回的单个维度 */
@@ -49,6 +52,9 @@ interface ElementFromApi {
   value_for_prompt: string;
   position: string;
   is_text_slot: boolean;
+  /* 抽象属性维度（配色/风格/氛围，抠不出实体，2026-08-21）。为与「可变维度」
+   * 下拉框严格一对一，这类维度照常列出，只标注警示 + 默认不勾。 */
+  is_abstract?: boolean;
   extraction_prompt: string;
   variants: VariantFromApi[];
   /* 自定义变体的提示词模板，把 CUSTOM_PLACEHOLDER 换成用户输入即可（2026-08-20） */
@@ -94,6 +100,9 @@ interface JobItem {
   isOriginal: boolean;
   /** 用户自定义添加的变体（2026-08-20），界面加"自定义"徽标 */
   isCustom?: boolean;
+  /** 不可生成的原因（2026-08-21）：有值时 checkbox 置灰 + 悬浮提示，
+   *  但 labelCn 照常显示——页面的中文是给用户对照翻译用的，不能删 */
+  blockedReason?: string;
   prompt: string;
   /* 本地状态 */
   checked: boolean;
@@ -209,6 +218,7 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
             labelCn: v.label_cn,
             labelTranslated: v.label_translated,
             isOriginal: v.is_original,
+            blockedReason: v.blocked_reason,
             prompt: v.prompt,
             checked: false,
             status: 'idle',
@@ -247,16 +257,25 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
 
   const toggleChecked = (key: string) => {
     const cur = jobsRef.current.find((j) => j.key === key);
+    /* blocked 候选不可勾（该候选会让图里出现非英文文字，违反铁律）。
+     * checkbox 本身已 disabled，这里是防御——label 包裹时点文字也会触发 onChange。 */
+    if (cur?.blockedReason) return;
     patchJob(key, { checked: !cur?.checked });
   };
 
   /* 全选/取消该维度下所有还没生成的变体——本功能最常用的操作
-   * （"这个维度的 6 种都出一张"），逐个点太累 */
+   * （"这个维度的 6 种都出一张"），逐个点太累。
+   * 2026-08-21：必须跳过 blocked 候选，否则"全选"会把不可生成的也勾上；
+   * allChecked 的判定基数同步排除 blocked，否则按钮文案会永远停在"全选"。 */
   const toggleElementAll = (elementKey: string) => {
-    const group = jobsRef.current.filter((j) => j.elementKey === elementKey && j.status !== 'done');
+    const group = jobsRef.current.filter(
+      (j) => j.elementKey === elementKey && j.status !== 'done' && !j.blockedReason
+    );
     const allChecked = group.length > 0 && group.every((j) => j.checked);
     writeJobs(jobsRef.current.map((j) =>
-      j.elementKey === elementKey && j.status !== 'done' ? { ...j, checked: !allChecked } : j
+      j.elementKey === elementKey && j.status !== 'done' && !j.blockedReason
+        ? { ...j, checked: !allChecked }
+        : j
     ));
   };
 
@@ -265,9 +284,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
     patchJob(key, { downloadChecked: !cur?.downloadChecked });
   };
 
-  const checkedCount = jobs.filter((j) => j.checked && j.status !== 'done').length;
+  const checkedCount = jobs.filter((j) => j.checked && j.status !== 'done' && !j.blockedReason).length;
   /* 失败项数量（"重试全部失败"按钮用） */
-  const failedCount = jobs.filter((j) => j.status === 'failed').length;
+  /* 失败项数量（"重试全部失败"按钮用）。排除 blocked：它们重试也只会立刻再失败，
+   * 计入按钮条数会让"重试全部失败（3）"点完还剩 3 个，看起来像功能坏了。 */
+  const failedCount = jobs.filter((j) => j.status === 'failed' && !j.blockedReason).length;
   const doneJobs = jobs.filter((j) => j.status === 'done' && j.imageUrl);
   const zipCount = doneJobs.filter((j) => j.downloadChecked && j.taskId).length;
 
@@ -284,6 +305,15 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
         if (stopFlagRef.current) break;
         const next = jobsRef.current.find((j) => j.status === 'queued');
         if (!next) break;
+        /* 最后一道防线：blocked 项的 prompt 被后端清空了，提交上去只会拿到一张
+         * 无指令的废图还照样计费。前面三处守卫都拦过，这里兜底防状态异常。 */
+        if (next.blockedReason || !next.prompt) {
+          patchJob(next.key, {
+            status: 'failed',
+            error: next.blockedReason || '该候选没有可用的生成指令',
+          });
+          continue;
+        }
         patchJob(next.key, { status: 'generating', error: undefined });
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -323,12 +353,15 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
     }
   }, [ruleId, ruleCard, patchJob, sourceSize]);
 
-  /* 生成选中变体：勾选项置 queued 后启动队列 */
+  /* 生成选中变体：勾选项置 queued 后启动队列。
+   * blocked 项一律排除（守 checked 的最后一道防线：blocked 是后端算的，
+   * 前端 state 若因任何原因带着 checked 进来，也不能真的提交上去）。 */
   const handleGenerate = () => {
-    const targets = jobsRef.current.filter((j) => j.checked && j.status !== 'done');
+    const canRun = (j: JobItem) => j.checked && j.status !== 'done' && !j.blockedReason;
+    const targets = jobsRef.current.filter(canRun);
     if (targets.length === 0) return;
     writeJobs(jobsRef.current.map((j) =>
-      j.checked && j.status !== 'done' ? { ...j, status: 'queued' as const, error: undefined } : j
+      canRun(j) ? { ...j, status: 'queued' as const, error: undefined } : j
     ));
     void runQueue();
   };
@@ -336,15 +369,19 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
   /* 重试单个失败项（队列空闲时可点）——置回 queued 复用同一循环 */
   const handleRetry = (key: string) => {
     if (runningRef.current) return;
+    const cur = jobsRef.current.find((j) => j.key === key);
+    /* blocked 项重试也没用（后端没给指令），拦住避免用户反复点 */
+    if (cur?.blockedReason) return;
     patchJob(key, { status: 'queued', error: undefined });
     void runQueue();
   };
 
   /* 一键重试全部失败项（2026-08-20 用户需求）。生成循环的语义是"处理所有 queued 项"，
-   * 所以只要把失败项批量置回 queued 再启动同一个 runQueue 即可，不用另写重试逻辑。 */
+   * 所以只要把失败项批量置回 queued 再启动同一个 runQueue 即可，不用另写重试逻辑。
+   * blocked 项排除：它们会被 runQueue 立刻打回 failed，重试只是空转。 */
   const handleRetryAllFailed = () => {
     if (runningRef.current) return;
-    const failed = jobsRef.current.filter((j) => j.status === 'failed');
+    const failed = jobsRef.current.filter((j) => j.status === 'failed' && !j.blockedReason);
     if (failed.length === 0) return;
     const failedKeys = new Set(failed.map((j) => j.key));
     writeJobs(
@@ -385,6 +422,13 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
     );
     if (exists) {
       setErr('这个候选已经在列表里了');
+      return;
+    }
+    /* 文字类维度的自定义值会被**真的画进图里**，中文输入会让图出现中文字
+     * （违反项目铁律）。这里不能像后端候选那样预先翻译（用户随手输入的、拿不到
+     * 平行英文值），所以直接拦住并说明原因——比生成一张废图更省钱。 */
+    if (el.is_text_slot && hasCJK(raw)) {
+      setErr('文字类维度请用英文（图中不能出现中文），如 "Forever in our hearts"');
       return;
     }
     const job: JobItem = {
@@ -562,7 +606,10 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                 const groupChecked = group.filter((j) => j.checked && j.status !== 'done').length;
                 const groupDone = group.filter((j) => j.status === 'done').length;
                 const isExpanded = expandedKeys.has(el.element_key);
-                const pending = group.filter((j) => j.status !== 'done');
+                /* pending 排除 blocked：它们不参与"全选"，也不该计入按钮上的条数
+                 * （否则点了全选、数字却对不上，看起来像按钮坏了） */
+                const pending = group.filter((j) => j.status !== 'done' && !j.blockedReason);
+                const blockedCount = group.filter((j) => j.blockedReason).length;
                 const allChecked = pending.length > 0 && pending.every((j) => j.checked);
                 return (
                   <div key={el.element_key} className="bg-codex-bg border border-codex-border rounded-md overflow-hidden">
@@ -580,7 +627,26 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                         </span>
                         <span className="text-[11px] font-mono text-codex-text-secondary shrink-0">
                           {(el.variants || []).length} 个候选
+                          {blockedCount > 0 && `（${blockedCount} 不可用）`}
                         </span>
+                        {/* 2026-08-21：为与「可变维度」下拉框严格一对一，抽象属性与文案类
+                         * 维度不再被剔除，改为标注警示 + 默认不勾，由用户自己决定要不要抠 */}
+                        {el.is_abstract && (
+                          <span
+                            title="配色/风格/氛围这类抽象属性没有可单独抠出的实体，生成结果通常不可用"
+                            className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-codex-warning/15 text-codex-warning border border-codex-warning/30 shrink-0"
+                          >
+                            ⚠ 抽象属性
+                          </span>
+                        )}
+                        {el.is_text_slot && (
+                          <span
+                            title="文字类元素抠出来只是一段字，且抠字容易糊；生成的文案一律为英文（图中不能出现中文）"
+                            className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-codex-bg text-codex-text-secondary border border-codex-border shrink-0"
+                          >
+                            ⚠ 文字类
+                          </span>
+                        )}
                         {el.position && (
                           <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-codex-bg text-codex-text-secondary border border-codex-border shrink-0">
                             {el.position}
@@ -614,17 +680,24 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                         {group.map((job) => (
                           <label
                             key={job.key}
-                            className="flex items-start gap-2 px-1.5 py-1 rounded hover:bg-codex-card/50 cursor-pointer"
+                            title={job.blockedReason || undefined}
+                            className={`flex items-start gap-2 px-1.5 py-1 rounded ${
+                              job.blockedReason
+                                ? 'cursor-not-allowed opacity-60'
+                                : 'hover:bg-codex-card/50 cursor-pointer'
+                            }`}
                           >
                             <input
                               type="checkbox"
                               checked={job.checked}
-                              disabled={running || job.status === 'done'}
+                              disabled={running || job.status === 'done' || !!job.blockedReason}
                               onChange={() => toggleChecked(job.key)}
                               className="mt-0.5 cursor-pointer accent-codex-accent disabled:cursor-not-allowed"
                             />
                             <div className="flex-1 min-w-0">
                               <div className="flex flex-wrap items-center gap-1.5">
+                                {/* labelCn 与中文附注照常完整显示——页面上的中文是给用户
+                                  * 对照翻译用的，即使该候选不可生成也不能省 */}
                                 <span className="text-xs font-mono text-codex-text truncate">
                                   {job.labelCn}
                                   {job.labelTranslated && (
@@ -633,6 +706,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                                     </span>
                                   )}
                                 </span>
+                                {job.blockedReason && (
+                                  <span className="px-1 py-0.5 text-[10px] font-mono rounded bg-codex-danger/15 text-codex-danger border border-codex-danger/30">
+                                    不可生成
+                                  </span>
+                                )}
                                 {job.isOriginal && (
                                   <span className="px-1 py-0.5 text-[10px] font-mono rounded bg-codex-border/50 text-codex-text-secondary">
                                     原始
@@ -653,6 +731,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                                   <span className="text-[10px] font-mono text-codex-success">✅</span>
                                 )}
                               </div>
+                              {job.blockedReason && (
+                                <div className="text-[10px] font-mono text-codex-text-secondary truncate">
+                                  {job.blockedReason}
+                                </div>
+                              )}
                               {job.status === 'failed' && (
                                 <div className="flex items-center gap-2">
                                   <span className="text-[10px] font-mono text-codex-danger truncate" title={job.error}>
@@ -689,7 +772,11 @@ export default function ElementExtractSection({ ruleId, ruleCard }: ElementExtra
                                 }
                               }}
                               disabled={running}
-                              placeholder="自定义候选，如 pink moon / 粉色月亮"
+                              placeholder={
+                                el.is_text_slot
+                                  ? '自定义文案（英文），如 Forever in our hearts'
+                                  : '自定义候选，如 pink moon / 粉色月亮'
+                              }
                               maxLength={100}
                               className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-codex-bg border border-codex-border rounded text-codex-text placeholder:text-codex-text-secondary/60 focus:border-codex-accent outline-none disabled:opacity-50"
                             />

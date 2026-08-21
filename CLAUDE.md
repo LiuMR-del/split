@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # 后端（在 backend/ 目录下）
-pip install -r requirements.txt
+pip3 install -r requirements.txt   # 用 pip3 而非 pip：macOS 自带 Python 3 只提供 pip3，写 pip 会 command not found
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload   # --reload：代码改动自动重启，避免跑旧代码
 
 # 前端（在 frontend/ 目录下）
@@ -25,6 +25,50 @@ npm run lint         # ESLint 检查
 cd backend && python3 seed_rules.py
 ```
 
+## 验证检查（改动后必跑）
+
+**本项目没有单元测试框架**（无 pytest/jest，requirements 与 package.json 里都没有）。
+取而代之的是 `backend/checks/` 下的**数据驱动检查脚本**——它们拿 `data/rules/` 里的
+全库真实规则卡当输入做断言，这比隔离的单元测试更贴合本项目的实际故障模式
+（绝大多数缺陷是"某类真实规则卡数据触发了没考虑到的分支"，而不是函数级逻辑错）。
+
+```bash
+cd backend
+python3 checks/run_all.py            # 全部（约 20 秒）
+python3 checks/run_all.py --quick    # 跳过零回归对比（它要起子进程 + git show）
+python3 checks/check_element_list.py # 单跑某一个
+python3 checks/check_regression.py <git-ref>   # 与指定提交比，默认 HEAD
+```
+
+退出码 0 = 通过。**改哪块代码该跑哪个**：
+
+| 改动的地方 | 必跑 |
+|---|---|
+| `extract_element_list` / `_build_element_variants` / 抠图模板 | 全部四个 |
+| 提示词组装（`_build_image_prompts` / `generate_version_a`） | `check_no_cjk_in_prompt.py` |
+| `generate_version_c_template`（可变维度下拉框） | `check_element_list.py`（它比对两条链路是否仍一对一） |
+| `_requires_non_latin_text` / `_is_abstract_dimension` 等判据 | `check_blocked_keywords.py` + `check_element_list.py` |
+
+**`check_regression.py` 是这里最有价值的一个**：抠图模板的五段措辞每段都是实测出来的，
+删任何一段都会让抠图退化，而退化**只能靠看图发现**、代码层面完全静默。该脚本从
+`git show <ref>` 取旧版模块跑同一批规则卡，逐字节比对指令。已验证它真能抓到回归
+（注入"删掉风格锁定段"后 170 项全部报差异并定位到字符位置）。
+
+⚠️ 写这类"对比旧版"的脚本时注意 `sys.path` 顺序：旧版临时目录必须排在当前版
+`backend/` **之前**，否则子进程 import 到的还是当前版，结果永远"逐字节一致"——
+这是最危险的假绿（检查看起来在跑、实际什么都没验，本项目已踩过一次）。
+脚本里加了 `assert m.__file__.startswith(tmp)` 兜底。
+
+## 部署与数据（换电脑时看这里）
+
+仓库**只含源码**，以下不入库，换机后是一套干净空系统（详见 README.md）：
+
+- `backend/data/config.json`（AI 分析凭证）、`gen_config.json`（生图凭证）——需在页面配置区重填。
+  ⚠️ 两者的 `api_url` 格式约定**不同**，见下方"两套 API 配置"条目，照抄是高频错误
+- `backend/data/*.db`、`rules/`、`uploads/`、`library/`、`gen/`——**已积累的规则库需自行拷贝**
+  （迁移方式：整个 `backend/data/` 目录拷过去）
+- `node_modules/`、`frontend/.next/`
+
 ## 技术栈
 
 - **前端**: Next.js 16 (App Router) + React 19 + TypeScript 5 + Tailwind CSS v4
@@ -33,6 +77,61 @@ cd backend && python3 seed_rules.py
 - **AI 调用**: httpx 异步请求，适配 OpenAI/Anthropic 两种 API 格式
 - **生图**: 双模式——OpenAI 同步（gpt-image-2）+ AIReiter 异步（submit → poll query）
 - **图片格式**: 支持 AVIF/HEIF（通过 pillow-heif 自动转 JPEG 发给 VLM）
+
+## 端到端管线（先看这节再看下面的细则）
+
+下面的「关键架构约定」是几十条细粒度铁律，逐条读不出全貌。整体是**一条四段流水线**，
+每段的产物是下一段的输入，磁盘上都有对应落点：
+
+```
+① 分析    上传竞品图 → POST /api/analyze → image_analyzer.analyze
+              └ 两路 VLM 并行（asyncio.gather）：SABC 分级 + 6 层拆解
+              └ 落盘 data/uploads/<原图>  +  data/rules/RULE-xxxx.json
+② 规则卡  6 层结构（第0层核心卖点锚定 … 第5层数据验证），人工可编辑后入库
+              └ 第 3 层 replaceable_elements 是后续两条链路的**共同数据源**
+③ 提示词  三版并排，各自独立操作：
+              A 资料库关联（两轮匹配图库参考图）→ POST /api/prompts/generate-a
+              B AI 推荐改款（可多套方案）      → POST /api/prompts/generate-b
+              C 自定义模板（下拉框选变体）      → GET /api/prompts/template-c/{id}
+                                                 + POST /api/prompts/generate-c
+              └ 产出 image_prompt_positive（完整描述式）
+                    + image_prompt_edit（编辑指令式，配参考图用）
+④ 生图    POST /api/gen/submit → image_gen_client
+              └ openai 同步：有参考图走 /v1/images/edits，无图走 /v1/images/generations
+              └ aireiter 异步：submit → 轮询 query
+              └ 落盘 data/gen/tasks/*.json + data/gen/images/
+```
+
+**旁支**：元素变体素材（`GET /api/prompts/elements/{id}` → 前端逐元素复用
+`/api/gen/submit` 且 `version='E'`），把第 3 层每个维度的每个候选各抠成一张透明底素材。
+它与版本 C 的下拉框**共享第 3 层数据源、必须严格一对一**（见 `check_element_list.py`）。
+
+### 存储布局（四个 store 的实际落点）
+
+| store | JSON 落点 | SQLite | 说明 |
+|---|---|---|---|
+| `rule_store` | `data/rules/RULE-*.json` | `rules.db` | 原图在 `data/uploads/` |
+| `image_library_store` | `data/library/IMG-*.json` | `rules.db` | 图在 `library/images` + `thumbnails` |
+| `image_gen_store` | `data/gen/tasks/GEN-*.json` | `rules.db` | 出图在 `data/gen/images/`，参考图在 `gen/refs/` |
+| `user_prefs_store` | `data/user_prefs.json` | **无** | 数据量极小，不需筛选排序 |
+
+⚠️ **三个 store 共用同一个 `data/rules.db` 文件**（后两个的代码注释写着"复用已有的
+SQLite 数据库文件"），各自建自己的表。改 schema 或加索引时要意识到这一点。
+SQLite 只存筛选/排序字段，完整数据始终在 JSON 里——**JSON 是唯一事实来源**。
+
+`main.py` 把五个目录挂成静态路由供前端直接取图：`/uploads`、`/library-images`、
+`/library-thumbnails`、`/gen-images`、`/gen-refs`。
+
+⚠️ 但**参考图路径白名单只认其中三个**（`routers/image_gen.py` 的
+`_REFERENCE_PATH_WHITELIST`：`/uploads/`、`/library-images/`、`/gen-refs/`）——
+静态挂载是"能不能显示"，白名单是"能不能作为参考图回传给后端"，两者范围不同，
+别以为挂了就能传。缩略图与生成结果图不在白名单内是有意的。
+
+### 前端页面与动线
+
+`app/analyze`（上传+批量队列）→ `app/rules`（规则库列表）→ `app/rules/[id]`
+（规则卡详情 + A/B/C 三栏提示词 + 元素变体）→ `app/gen`（生图任务页）；
+另有 `app/library`（自有图库）、`app/settings`（AI 与生图凭证）。
 
 ## 关键架构约定
 
@@ -88,13 +187,20 @@ cd backend && python3 seed_rules.py
   - **抠图判定方向必须是"严判背景，其余全保留"，不是"判定内容"**（2026-08-18 v2 重构，**推翻昨天 v1 的 `FLOOD_WHITE_DIST=40` 宽容差设计**）：v1 的两个机制在真实案例 GEN-0175（奶油色拉布拉多）上同时失效——① 全局软阈值把离白距离 14~45 的浅毛判成半透明；② 宽容差 40 的洪水填充把浅毛也算"白"、指望主体轮廓当屏障，但浅毛边界本身近白、屏障有缺口，洪水漏进主体内部形成整片灰斑（数学指纹验证：存储 alpha 与软阈值公式误差中位数 1.8，确认是本地算法所为而非上游）。v2 判据（`_classify_background`）：背景必须**同时满足**离白距离 ≤ 自适应容差（`_estimate_bg_tol` 四角采样取最干净角的 p99+3，clip 到 [4,12]——实测上游 `background=opaque` 整图背景 p99=2，与最浅内容（距离 ≥5）有干净空档）**且**从画布边缘洪水可达（4 邻接）；环形中心例外照旧（封闭白区 ≥2% 判背景）；其余像素**一律 alpha=255**，软过渡只留在背景膨胀 4px 的羽化带内。实测：GEN-0175 内部斑块 0.30%→**0.000%**，圆环中心仍正确透明，24 张历史图 + 2 张 opaque 整图零回归。**验收必须同时测三类：浅色主体（斑块）、环形元素（中心透明）、细枝叶（间隙不被误填），三类的失败方向互相冲突，只测一类必漏另两类**
   - **画布比例跟随的是"印刷图案"而不是"上传文件"**（2026-08-18 修正，**此前只跟文件比例是错的**）：`GET /api/prompts/elements/{rule_id}` 返回 `source_width/source_height`（Pillow 读原图）+ `artwork_orientation`，前端提交时用它而非固定 1024 方图——抠取要求"保持原比例"，方图会把竖版竞品图挤扁、位置必然错。**但文件比例 ≠ 图案比例**：竞品图常是实物摆拍，RULE-0063 是 2000×2000 方形照片、拍的却是户外灯笼，真正的印刷图案是面板上约 1:2.2 的窄竖条，四周全是灯具外壳与草地虚化背景（用户反馈"元素比例应基于图案而非上传图"）。所以 `rule_extraction` prompt 新增第 2 层 `artwork_orientation` 字段（**只三档粗分类** portrait/landscape/square——精确比例 VLM 给不准，且 `_get_openai_size` 本来只有 1:1 / 3:2 / 2:3 三个桶，粗分类够用），后端 `routers/prompts.py` 的 `_apply_orientation` 按它**重排长短边**（方图文件 + portrait 时无短边可用，按 2:3 构造）。实测 RULE-0063：VLM 输出 `portrait`（未经引导时也自述"实物摆拍、印刷图案是高而窄的竖向长方形"），画布 2000×2000 → 1333×2000，尺寸桶 `1024x1024` → `1024x1536`。字段是 Optional，**旧规则卡取不到时回落文件比例**，行为与改动前一致。结果网格用 `object-contain` + **棋盘格底衬**（`CHECKER_STYLE`，CSS 渐变不引图片）——透明 PNG 放在白/深色卡片上都看不出哪里是透明的
   - **两个抠取模板的画布措辞必须锚定"印刷图案区域"，否则与校正后的画布请求自相矛盾**：旧措辞 `same aspect ratio and framing as the provided image` 让模型对齐**整张照片**——当后端已按 `artwork_orientation` 请求竖版画布时，一句要方一句要竖，模型只能二选一。改为 `same aspect ratio and framing as the printed artwork area of the provided image (if the image is a product photo, this is the artwork panel only, not the whole photograph)`，与模板第 4 段"忽略画框/实物语境"同向加强。**擦除模板与替换模板都要改**（两处措辞一致）
-  - **元素清单只出图形元素**：`extract_element_list` 末尾过滤掉 `is_text_slot` 的项（2026-08-17 用户确认口径："只看图中的构建元素"）。文字类（名字/年份/纪念文案 + "名字文字区"这类描述位）抠出来只是一段字、且抠字极易糊，不进清单；但 `is_text_slot` 的**解析仍然必需**——它就是这里的过滤依据
+  - **元素清单与「可变维度」下拉框严格一对一**（2026-08-21 用户口径，**推翻 2026-08-17 的"只出图形元素"**）：`extract_element_list` 的数据源**只有第 3 层 `replaceable_elements`**，按 key 一对一、顺序一致，与 `generate_version_c_template`（可变维度下拉框，本来就是这个 dict 原样映射）完全同源。用户原话："元素变体素材要严格按照可变维度的变体列表，包括文案那些"。改动前两条链路各自判断，实测**全库 57 张卡有 56 张不一致**（第 3 层 310 个维度只出 168 个，反而多出 48 个下拉框里根本没有的第 2 层项）。因此所有判断从"剔除"改为"**打标**"，决定权交给用户（前端默认全不勾）：`is_text_slot` → 走文字类专用模板 + 前端标「⚠ 文字类」；`is_abstract` → 前端标「⚠ 抽象属性」。⚠️ 三处"故意没有"的删除必须保留原样，否则一对一会被破坏：① **不按 `value_for_prompt` 去重**（两个维度的 original 恰好同值时会吃掉一个）；② **不收第 2 层、不跑四道去重防线**；③ **不过滤 `is_text_slot`**（但该字段的解析仍必需——它是"选哪套模板"和"候选值要不要转英文"的依据）。零回归已验证：改动前后**图形类 168 个元素的 extraction_prompt 与 variants 逐字节完全一致**
+  - **页面显示的中文与 prompt 取值是两条独立的路，改语言相关逻辑前必须先分清改的是哪条**（2026-08-21 用户明确区分）：**页面显示**（`label_cn` + `label_translated`，渲染成 `english（中文）`）**必须有中文**——用户要对照翻译，本次零删减；**prompt 取值**（`label_for_prompt`）守"图无中文 R1"铁律。推论：某候选"不能生成"与"页面显示什么"无关——blocked 候选的中文名照常完整显示，只是 checkbox 置灰。**图形类候选用中文值是既有正常路径不要改**：中文只是给模型定位"图里哪个东西"（`REPLACE it with 小兔子`），实测 7 张旧卡 87/87 变体指令含中文且正常工作；只有**文字类**候选的值会被真的画进图里，才需要管语言
+  - **文字类元素走专用抠图模板**（`ELEMENT_TEXT_EXTRACTION_PROMPT_TEMPLATE` / `ELEMENT_TEXT_VARIANT_PROMPT_TEMPLATE`，2026-08-21）：图形版模板写死 `plus all text, all lettering, all numbers`——抠**文字本身**时那句会把目标文字自己擦掉，必然失败。文字版与图形版**差异只有两处**，其余五段实测结论逐字沿用不重新发明：① `plus all text...` → `plus every OTHER text...`；② 追加字形锁定（typeface/weight/letter-spacing/color，文字素材要能叠回原设计）+ `English only` 正向引导（同 `_build_image_prompts` 的 `english text only`，负向词有"粉红大象"效应）。四个消费点都要按 `is_text_slot` 二选一：`extraction_prompt`、`_build_element_variants`、`_build_custom_variant_template`（自定义变体值无法预先翻译，只能靠模板引导）
+  - **两个翻译函数方向相反，用途不同，绝不可混用**（2026-08-21）：`translate_element_labels`（**英→中**，写 `label_translated`，**只给页面显示**，翻错不影响生成）vs `translate_variant_prompts_to_en`（**中→英**，改写 `label_for_prompt` **并同步替换 prompt 里的旧值**，要发给生图模型）。元素端点两个都调（各自只在有对应待翻译项时才真发请求）。中→英只处理文字类：7 张 7 月初的旧卡（RULE-0001/0014/0015/0017/0018/0019/0020）**整卡没有 `_en` 字段**，若直接丢弃这些候选，RULE-0019「励志金句内容」等维度会整组不可用，所以翻译顶上（实测 `12条团队精神短句` → 页面仍显示中文、prompt 里是 `12 team spirit short quotes`）。⚠️ **`element_role` 也必须翻，且要覆盖 `custom_prompt_template`**：它在模板里出现 3 次、是"要写什么字"的依据。两个坑都实测踩过——① 只翻候选值会漏 role；② 只改 `variants[]` 会漏 `custom_prompt_template`（RULE-0015/0019/0020 三个维度复现：前端 `handleAddCustom` 只校验**用户输入**不含中文，管不了模板自带的中文 role，用户输入合法英文、发出去的指令里仍有两处中文）。⚠️ **role 的中文原值本身要进待翻译词条，不能只指望 `variants[0]` 的翻译结果**——漂移卡（`original` 纯英文、`original_en` 反含中文，同 RULE-0070 那类）会让 role 含中文而 `variants[0].label_cn` 是英文、进不了 mapping，role 就永远翻不掉（已构造复现并修复）。五重容错全部静默降级回落中文值：无 AI / 调用失败 / 数量不符 / **翻译结果自身含 CJK 则拒收** / 全部不可用，绝不让端点 500
+  - **语义上要求非拉丁文字的候选要 blocked**（`_requires_non_latin_text`，2026-08-21）：挡的是"意思就是写中文"的候选，**不是"值恰好是中文"**（后者靠翻译解决）。判定用中英值合并串——`中文纪念短句` 的英文平行值是 `Chinese memorial short quote`，**值本身纯英文、过得了 CJK 检测**，但语义直接违反铁律，翻译也救不了（翻完还是这个意思）。实测全库仅 RULE-0071「纪念文案内容」命中 1 个候选，**没有任何维度整组不可用**。⚠️ **英文关键词必须用正则词边界（`\b`），中文才用子串**：裸子串会让 `arabic` 命中 **Arabic**a（咖啡品种）、`thai` 命中 **Thai**land（国名），这俩都是 POD 印花高频题材、与文字系统无关；且命中语言词但带风格修饰（`Japanese-style`/`日式`）要豁免——那说的是版式风格不是文字系统。**blocked 是唯一没有 override 的状态（候选永久不可勾），误封的代价大于漏封**，所以改判据必须同时跑"该挡的要挡住"和"不该挡的别误伤"两组用例（现有 8 组）
+  - ~~**元素清单只出图形元素**~~（2026-08-17 旧口径，**已被上面 2026-08-21 的一对一口径推翻，保留供追溯**）：`extract_element_list` 末尾过滤掉 `is_text_slot` 的项（"只看图中的构建元素"）。文字类抠出来只是一段字、且抠字极易糊，不进清单
   - **第3层 original/alternatives 的语言钉死中文，英文候选名走翻译附注**（2026-08-18）：prompt 只钉维度名不钉值时，上游换后端会输出**中英字段全英文**的漂移卡（RULE-0070 `original='softball'` 且 `original_en='softball'`，中文源头缺失）。①源头：`rule_extraction` 明确 original/alternatives 必须中文、英文只进 `*_en`——**唯一例外 `is_text_slot=true`**，文字槽位的 original 是图上原文（名字/年份/英文标语）必须照抄不翻译；②存量兜底：元素端点调 `translate_element_labels`（复用版本C `get_option_translation_prompt` 同款机制）对不含 CJK 的候选名做**一次**批量翻译，写 `label_translated` 供前端显示 `english（中文）`。全中文/纯数字标签零 AI 调用，无 AI/失败静默跳过；**元素端点契约由"纯同步不调 AI"放宽为"必要时一次翻译调用"**。翻译结果不落盘（每次加载现翻，同版本C 行为）
   - **生图任务记录从不自动清理，"消失"是分页默认值**：磁盘全量保留，`GET /api/gen/tasks` 默认 `page_size=20` 只返回最新 20 条——一次元素变体生成就是 20 条，正好把旧记录挤出第一页（2026-08-18 用户误以为被清理）。前端 gen 页用"⬇ 加载更多"按页追加，**不能一次拉全量**（`image_urls` 含 base64 大图，全量是几十 MB）。⚠️ `loadTasks` 加了 `pageArg` 参数后，`onClick={loadTasks}` 这种直接引用会把**点击事件对象当页码**传进去——改回调签名必须排查所有调用点改成 `() => loadTasks(1)`。删除任务时 `total` 同步减一；状态筛选是前端过滤"已加载的任务"，未加载页的任务要先加载更多才会出现
   - **真正要生成的是"每个维度下的每个候选变体"，不是只抠原图那一个元素**（2026-08-17 用户澄清）：每个元素带 `variants` 数组 = `original`（走擦除模板，图里本来就有）+ 各 `alternatives`（走 `ELEMENT_VARIANT_PROMPT_TEMPLATE` 替换模板，图里没有需要"换出来"）。一个维度 6 个候选 = 6 张同位置/同姿态/同风格的透明底素材，用户叠换即得 6 个变体设计。**替换模板与擦除模板的差别**：`REPLACE it with {variant}` + 强调"必须占据完全相同的位置/尺寸/取景"（只说"换成猫"模型会重新构图，一组变体之间就不通用了）+ `pose_clause`（仅当规则卡有**成句英文描述**时才加，第3层的 `value_cn` 常常就是个短标签如"金毛犬"，拿它当姿态说明毫无信息量）+ 风格锁定改为"与原图中**该元素**的渲染风格一致"（变体要和原设计其他元素放一起，风格得对齐原元素而非某种画风）
-  - **中文维度名判重（防线①-d，`_cn_name_overlaps`）三级判定**：第2层与第3层描述同一位置时**英文措辞可能毫无重叠**，词级判重（①-c）挡不住——实测 `宠物类型='Golden retriever'`（第3层）与 `主体宠物肖像区='A front-facing half-body portrait of a single pet…'`（第2层）实词交集为空，但中文名都含"宠物"。漏判的后果比多抠一张更糟：第2层项没有 `alternatives`，会在界面上多出一个"只有 1 个候选"的重复维度干扰勾选。**一级**剥结构性后缀取核心名做子串比对（**后缀表顺序关键：长词必须排在其短后缀之前**——若 `型` 先于 `造型` 被剥掉，`尾巴造型` 会变成 `尾巴造`，与 `人鱼尾巴` 失去子串关系，实测踩过）；**二级**共享实体名词（`_ENTITY_NOUNS`）+ 同义/上下位词组（`_ENTITY_SYNONYM_GROUPS`）——挡 `花卉风格` vs `花卉装饰`（修饰词位置不同，互不为子串）与 `点缀昆虫='紫色蝴蝶'` vs `蝴蝶点缀`（上位词 vs 下位词，字面无重叠且英文 `butterflies`/`butterfly` 因粗糙去复数也对不上，三道防线原本全漏）；**三级**共享角色词（`_ROLE_WORDS`，主体/中心/角色/装饰/点缀…）——挡 `主体角色` vs `主体恐龙形象`、`中心主体角色` vs `中心运动员形象`，收紧条件防误伤：须共享 ≥2 个角色词，或共享 1 个且有一方去掉角色词后为空（= 纯泛化槽位）。实测 19 组用例全对（11 组真重复全挡住 + 8 组不同元素零误判，含 `海龟前景角色` vs `前景植物装饰` 这类只共享 1 个角色词但两边都有实义的），全库维度数 213→198
-  - **抽象属性判定里"实体名词优先于抽象关键词"（`_is_abstract_dimension`）**：抽象关键词表含"风格/配色/构图"等，但它们在维度名里**可能只是修饰词**——实测 RULE-0067 的 `边框花卉风格`（画面里真实存在的花卉边框、带 4 个候选变体）因名字带"风格"被整个判为抽象属性丢掉，界面上只剩第2层那个没有候选的 `花卉边框装饰区`，表现为"元素变体素材与可变维度下拉框内容不一致"（用户实测反馈）。所以命中抽象关键词后要再看名字里有没有实体名词（`_ENTITY_NOUNS`），有则不判抽象。真正的抽象维度（`整体色彩风格`/`排版布局`/`画面氛围`）不含实体词，不受影响；`背景色='纯白背景'` 仍由"纯色底按值判断"那条挡住。**改这两个函数必须同时跑"真重复要挡住"和"不同元素不能误判"两组用例**，只测一组会往另一个方向翻车
-  - **元素清单三道去重 + 两类排除**（`extract_element_list`）：第2/3 层常记录同一元素，光靠 key/子串去重挡不住。防线①-a 槽位名同名、①-b 描述含已收集值（`_get_pod_hints` 同款）、**①-c 词级重叠判重**（`_is_semantic_duplicate`，实词集合重叠率 ≥0.7 按较短一方算——实测 `尾巴造型='Glowing blue-green scaled tail'` 与 `人鱼尾巴='A long scaled mermaid tail in blue-green tones…'` 无子串关系但重叠 100%，而"鱼群+水母+海龟"整组 vs 单独"左下角海龟"只 40%，阈值能分开）、防线② 全列表按 `value_for_prompt` 保序去重。排除两类不可抠项：**抽象属性**（`_is_abstract_dimension`，风格/配色/氛围/构图，按**维度名**判断）与**纯色底**（按**值**判断而非按名——`背景光效='水下阳光光束'` 名字带"背景"但确实可抠，不能误伤）。实测 RULE-0043 从两层 12 项去到 7 项
+  - **中文维度名判重（防线①-d，`_cn_name_overlaps`）三级判定** ⚠️ **2026-08-21 起已停用**（元素清单不再收第 2 层，这道防线失去调用方；函数定义保留未删，19 组用例的调优结论仍有参考价值，且 `_ENTITY_NOUNS` 仍被 `_is_abstract_dimension` 使用）。以下为当时的设计记录：第2层与第3层描述同一位置时**英文措辞可能毫无重叠**，词级判重（①-c）挡不住——实测 `宠物类型='Golden retriever'`（第3层）与 `主体宠物肖像区='A front-facing half-body portrait of a single pet…'`（第2层）实词交集为空，但中文名都含"宠物"。漏判的后果比多抠一张更糟：第2层项没有 `alternatives`，会在界面上多出一个"只有 1 个候选"的重复维度干扰勾选。**一级**剥结构性后缀取核心名做子串比对（**后缀表顺序关键：长词必须排在其短后缀之前**——若 `型` 先于 `造型` 被剥掉，`尾巴造型` 会变成 `尾巴造`，与 `人鱼尾巴` 失去子串关系，实测踩过）；**二级**共享实体名词（`_ENTITY_NOUNS`）+ 同义/上下位词组（`_ENTITY_SYNONYM_GROUPS`）——挡 `花卉风格` vs `花卉装饰`（修饰词位置不同，互不为子串）与 `点缀昆虫='紫色蝴蝶'` vs `蝴蝶点缀`（上位词 vs 下位词，字面无重叠且英文 `butterflies`/`butterfly` 因粗糙去复数也对不上，三道防线原本全漏）；**三级**共享角色词（`_ROLE_WORDS`，主体/中心/角色/装饰/点缀…）——挡 `主体角色` vs `主体恐龙形象`、`中心主体角色` vs `中心运动员形象`，收紧条件防误伤：须共享 ≥2 个角色词，或共享 1 个且有一方去掉角色词后为空（= 纯泛化槽位）。实测 19 组用例全对（11 组真重复全挡住 + 8 组不同元素零误判，含 `海龟前景角色` vs `前景植物装饰` 这类只共享 1 个角色词但两边都有实义的），全库维度数 213→198
+  - **抽象属性判定里"实体名词优先于抽象关键词"（`_is_abstract_dimension`）**：抽象关键词表含"风格/配色/构图"等，但它们在维度名里**可能只是修饰词**——实测 RULE-0067 的 `边框花卉风格`（画面里真实存在的花卉边框、带 4 个候选变体）因名字带"风格"被整个判为抽象属性丢掉，界面上只剩第2层那个没有候选的 `花卉边框装饰区`，表现为"元素变体素材与可变维度下拉框内容不一致"（用户实测反馈）。所以命中抽象关键词后要再看名字里有没有实体名词（`_ENTITY_NOUNS`），有则不判抽象。真正的抽象维度（`整体色彩风格`/`排版布局`/`画面氛围`）不含实体词，不受影响；`背景色='纯白背景'` 仍由"纯色底按值判断"那条挡住。**改这两个函数必须同时跑"真重复要挡住"和"不同元素不能误判"两组用例**，只测一组会往另一个方向翻车。⚠️ **2026-08-21 起该函数的返回值不再用于剔除，改为打 `is_abstract` 标记**（一对一口径下不能丢维度），判错的代价从"维度消失"降为"多/少一个警示徽标"，但判准仍然有意义——用户靠这个徽标决定要不要花钱抠。实测 RULE-0001 正确标出 `色彩方案`/`风格`/`场景切换` 三个，RULE-0071 的 `背景色调='深蓝色天空海面背景'`（实体画面）正确不标
+  - ~~**元素清单三道去重 + 两类排除**~~（`extract_element_list`）⚠️ **2026-08-21 起大部分停用**：三道去重（①-a 槽位名同名 / ①-b 描述含已收集值 / ①-c 词级重叠 / ①-d 中文维度名）与防线②（按 `value_for_prompt` 保序去重）随"只收第 3 层"一并废弃；「抽象属性」由排除改为打 `is_abstract` 标记，「纯色底」判断（在同一函数内）随之也只用于打标。**仍在生效的只剩 `_is_semantic_duplicate` 的另一处用途**：生成 `others` 擦除清单时排掉与目标高度重叠的表述，防"擦掉 X"与"保留 X"自相矛盾——改这个函数仍要跑用例。以下为原设计记录：第2/3 层常记录同一元素，光靠 key/子串去重挡不住。**①-c 词级重叠判重**（`_is_semantic_duplicate`，实词集合重叠率 ≥0.7 按较短一方算——实测 `尾巴造型='Glowing blue-green scaled tail'` 与 `人鱼尾巴='A long scaled mermaid tail in blue-green tones…'` 无子串关系但重叠 100%，而"鱼群+水母+海龟"整组 vs 单独"左下角海龟"只 40%，阈值能分开）。排除两类不可抠项：**抽象属性**（按**维度名**判断）与**纯色底**（按**值**判断而非按名——`背景光效='水下阳光光束'` 名字带"背景"但确实可抠，不能误伤）。实测 RULE-0043 从两层 12 项去到 7 项
+  - **`others` 擦除清单仍收两层的全部元素**（含文字位、含第 2 层描述）：第 2 层虽不再作为**可抠元素**进清单，但它记录的元素确实在画面上、抠图时同样得擦掉。清单里含中文是**既有正常行为**（点名用中文定位，不是要模型画字），改动前后一致，不要"顺手修掉"。⚠️ **排掉目标自己必须再加一层字面子串判断**（2026-08-21）：`_is_semantic_duplicate` 依赖 `_semantic_words`，它只取长度 >2 的英文单词，`2012-2026`/`1758-1848` 提取出**空集**直接返回 False，防线失效——文字位进清单后这类目标（日期/年份）变得常见，实测 RULE-0015「日期」、RULE-0017「年份」的指令同时要求"保留 2012-2026"和"擦掉…如'2012-2026'"，自相矛盾。补 `if target in label: continue` 兜底（不动 `_is_semantic_duplicate`，它另有在用的调用方，改动风险更大）
+  - **`pose_clause` 是死代码，别误以为它在生效**（2026-08-21 实测）：`_build_element_variants` / `_build_custom_variant_template` 都从 `_raw["description_en"]` 取姿态描述，但**第 3 层 310 个维度全都没有这个字段**（只有第 2 层元素才有），改动前全库 939 张变体的 prompt **零命中** `keep the same pose and composition`。所以"去掉第 2 层"不造成回归（第 2 层项无 `alternatives`、只走擦除分支，根本进不了替换模板）。代码保留是为将来让 VLM 给第 3 层补形态描述时能直接生效——**改它之前先确认字段是否真有值**
   - **文字位判断走 `_looks_like_text_slot`**：显式 `is_text_slot` 字段优先，**缺失时按关键词兜底**（与 `_get_pod_hints` 同一份 `_TEXT_SLOT_KEYWORDS`）——旧规则卡整卡都没有 `is_text_slot` 字段，只认字段会把"名字/日期"当普通图案元素（排序错、默认勾选错）
   - **`POST /api/gen/download-zip` 返回裸 zip 二进制，不走 `{success, data}` 包装格式**（下载类端点的既定例外）。前端**不能用 `apiPost`**（会 `response.json()` 直接崩），必须原生 `fetch` 取 `res.blob()`。幂等：已下载过的复用 `task.local_images` 不重复拉远端；单任务失败跳过不中断，全空才 400；zip 内文件名带 `task_id` 前缀防同名覆盖
 - **元素拆分入口是按钮触发（三期阶段四，用户补充需求）**: 元素拆分是低频功能（只有个别产品用得到），`ElementExtractSection` 默认**只渲染一行入口按钮、零请求、不渲染面板**（`activated` state 初始 false）；点击才并行取元素清单 + `getSupportsReference()`。无竞品原图时按钮直接置灰（纯 props 判断 `ruleCard.source_images`，零请求）。入口按钮只负责激活与加载，**绝不自动开始生成**——生成必须"勾选元素 → 点生成"二次确认（每个元素一次付费调用，默认全不勾）。已加载过的清单在收起再展开时不重复请求

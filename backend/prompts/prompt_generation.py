@@ -182,6 +182,43 @@ def get_option_translation_prompt(terms_json: str) -> str:
 """
 
 
+def get_variant_en_translation_prompt(terms_json: str) -> str:
+    """生成让 AI 把中文候选值批量译成英文的系统提示词（元素变体的**文字类**候选用）。
+
+    ⚠️ 与 `get_option_translation_prompt` **方向相反、用途不同，不可混用**：
+    - `get_option_translation_prompt`：英→中，结果进 `label_cn`/`label_translated`，
+      **只给前端小字显示**，翻错不影响生成。
+    - 本函数：中→英，结果进 `label_for_prompt`，**要拼进发给生图模型的抠图指令**。
+
+    为什么只有文字类候选需要：图形类候选的中文值（"小兔子"）只是给模型定位"图里
+    哪个东西"，不会被画成字，一直是正常路径（见 ELEMENT_EXTRACTION_PROMPT_TEMPLATE
+    的注释）。但文字类候选的值本身**就是要印进图里的文案**（"12条团队精神短句"），
+    中文进去就会画出中文字，直接违反"图无中文 R1"铁律。
+
+    7 张 7 月初分析的旧卡（RULE-0001/0014/0015/0017/0018/0019/0020）整卡没有
+    `alternatives_en` 字段，取不到英文平行值，只能临时翻译顶上。结果不落盘
+    （每次加载现翻，同版本C 选项翻译的既有行为），也不改 `label_cn`——
+    页面照旧显示中文，用户对照翻译的需求不受影响。
+    """
+    return f"""你是一个翻译助手，负责把一批中文词条翻译成适合图像生成提示词使用的英文短语。
+
+待翻译词条（JSON 数组）：
+{terms_json}
+
+要求：
+1. 逐条翻译，保持原数组顺序，输出数组长度必须与输入一致
+2. 译成**简洁的英文名词短语**，直接可用于图像生成提示词，不要整句、不要解释
+3. 数量词照实保留（如"12条团队精神短句"译成"12 team-spirit short quotes"）
+4. 输出只能是英文字母、数字和常见标点，**绝对不能包含任何中文字符**
+5. 词条若含"中文/日文"等语言要求，忽略该语言要求只译其余含义（生成的图不能出现非英文文字）
+
+请严格按以下 JSON 格式输出，不要添加 markdown 代码块标记或其他说明文字：
+{{
+    "translations": ["[第1条词条的英文短语]", "[第2条词条的英文短语]"]
+}}
+"""
+
+
 
 # ==================== 元素拆分图（三期阶段四） ====================
 
@@ -279,3 +316,71 @@ ELEMENT_VARIANT_PROMPT_TEMPLATE = (
     "flat 2D design and ignore any frame, product hardware, canvas texture or photographic "
     "background around it."
 )
+
+
+# ==================== 文字类元素专用模板（2026-08-21） ====================
+#
+# 背景：元素清单原本剔除全部文字类维度（2026-08-17 口径），2026-08-21 用户要求
+# 元素变体素材**严格对齐可变维度清单**，文案类维度（"纪念文案内容"、"励志金句内容"）
+# 也要能出素材，所以需要这两个模板。
+#
+# 为什么不能直接用上面两个模板：它们写死了 "plus all text, all lettering, all numbers"
+# ——那是为图形元素设计的（抠花卉时图上的字都得擦干净）。抠**文字本身**时这句会把
+# 目标文字自己也擦掉，等于必然失败。
+#
+# 与图形版的差异**只有两处**，其余五段实测结论（原位擦除 / 白底 / others 点名 /
+# 风格锁定 / 消除 mockup，由来见 ELEMENT_EXTRACTION_PROMPT_TEMPLATE 的注释）
+# 逐字沿用，不重新发明：
+#   1. "plus all text..." → "plus every OTHER text..."：保住目标文字，擦掉其他文字。
+#   2. 追加字形锁定 + English only：
+#      - 字形锁定（typeface/weight/letter-spacing/color）——文字素材要能叠回原设计，
+#        字体不一致就废了；图形版对应位置是"笔触/平涂"锁定，文字版换成排版属性。
+#      - "English only" 正向引导守"图无中文 R1"铁律。用正向而非负向是既有策略：
+#        OpenAI 模式下负向词合并进正向有"粉红大象"效应，正向引导更可靠
+#        （同 _build_image_prompts 的 "english text only"）。
+ELEMENT_TEXT_EXTRACTION_PROMPT_TEMPLATE = (
+    "From the provided image, keep ONLY the text {element} and delete everything else. "
+    "This is an erase-everything-else task, NOT a re-draw task: "
+    "{element} must stay at EXACTLY the same position, same size, same scale and same "
+    "orientation as in the provided image — do not move it, do not resize it, "
+    "do not re-center it, do not crop it. "
+    "Keep the output canvas the same aspect ratio and framing as the printed artwork area "
+    "of the provided image (if the image is a product photo, this is the artwork panel only, "
+    "not the whole photograph). "
+    "You MUST erase these — {others} — plus every OTHER text, lettering and number that is "
+    "not part of {element}, and the original background. Erasing the main subject is "
+    "REQUIRED if it is listed above: the output must contain {element} and nothing else. "
+    "Leave every erased area plain pure white. "
+    "Render the text in English only, using the exact same typeface, font weight, "
+    "letter-spacing, line breaks and color as in the provided image. "
+    "The provided image is a flat 2D printed artwork; treat it as digital illustration, "
+    "ignore any frame, canvas texture, or physical product context."
+)
+
+
+# 文字类元素的**变体替换**模板：把该文字位的内容换成另一个候选文案再抠出来。
+# 与 ELEMENT_VARIANT_PROMPT_TEMPLATE 的关系同上（只差"擦其他文字"与字形锁定两处）。
+#
+# ⚠️ {variant} 的取值必须是英文：文字类候选的值会被**真的画进图里**，
+# 中文值进来就是中文字。取值逻辑在 prompt_generator._build_element_variants
+# （alternatives_en 优先 → 无 CJK 值 → 中→英现翻 → 语义要求中文则 blocked 不给勾）。
+ELEMENT_TEXT_VARIANT_PROMPT_TEMPLATE = (
+    "From the provided image, keep ONLY the text in the {element_role}, but REPLACE its "
+    "content with {variant}. "
+    "The replacement text must occupy EXACTLY the same position, same size, same scale and "
+    "same framing as the original {element_role} in the provided image{pose_clause} — "
+    "do not move it, do not resize it, do not re-center it. "
+    "Keep the output canvas the same aspect ratio and framing as the printed artwork area "
+    "of the provided image (if the image is a product photo, this is the artwork panel only, "
+    "not the whole photograph). "
+    "You MUST erase these — {others} — plus every OTHER text, lettering and number that is "
+    "not part of the {element_role}, and the original background. Erasing them is REQUIRED: "
+    "the output must contain only the replaced text and nothing else. "
+    "Leave every erased area plain pure white. "
+    "Render the text in English only, using the exact same typeface, font weight, "
+    "letter-spacing and color as the original {element_role} in the provided image. "
+    "The provided image may be a photo of a printed product; treat the printed artwork as a "
+    "flat 2D design and ignore any frame, product hardware, canvas texture or photographic "
+    "background around it."
+)
+
